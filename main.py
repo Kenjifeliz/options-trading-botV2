@@ -25,7 +25,6 @@ TICKERS = [
     "QQQ",
     "GOOG",
     "SPY",
-    "META",
     "ORCL",
     "HIMS",
     "JPM",
@@ -41,10 +40,17 @@ START_TIME = pd.Timestamp("10:00").time()
 
 CONTRACTS = 5
 
-# KEEP OFF while we verify the 5-minute signals.
+# Keep OFF while verifying the live signals.
 ORDERS_ENABLED = False
 
 EMA_LENGTH = 9
+
+# Minimum distance between signal candle close and VWAP.
+# Example:
+# VWAP = 100.00
+# LONG requires close >= 100.28
+# SHORT requires close <= 99.72
+VWAP_DISTANCE_THRESHOLD = 0.28
 
 
 # ============================================
@@ -62,16 +68,17 @@ PAPER_MODE = (
 print("========================================")
 print("OPTIONS TRADING BOT")
 print("========================================")
-print("Timeframe:   5 minutes")
-print("Start time:  10:00 NY")
-print("Data feed:   IEX")
-print(f"Contracts:   {CONTRACTS}")
+print("Timeframe:       5 minutes")
+print("Start time:      10:00 NY")
+print("Data feed:       IEX")
+print(f"Contracts:       {CONTRACTS}")
+print(f"VWAP filter:     {VWAP_DISTANCE_THRESHOLD:.2f}%")
 print(
-    f"Orders:      "
+    f"Orders:          "
     f"{'ENABLED' if ORDERS_ENABLED else 'DISABLED'}"
 )
 print(
-    f"Paper mode:  "
+    f"Paper mode:      "
     f"{'ENABLED' if PAPER_MODE else 'DISABLED'}"
 )
 print("========================================")
@@ -179,6 +186,7 @@ def load_today_history():
         count = len(
             df[df["ticker"] == ticker]
         )
+
         print(
             f"{ticker:5s}: {count:,}"
         )
@@ -309,14 +317,23 @@ five_minute_history = {
 
 
 # ============================================
-# PENDING VWAP SIGNALS
+# OPEN POSITIONS / ENTRY TRACKING
+#
+# Used only for EMA9 exit timing.
+# Multiple overlapping positions are allowed.
 # ============================================
 
-pending_signals = {}
+active_entries = {
+    ticker: []
+    for ticker in TICKERS
+}
 
 
 # ============================================
 # SIGNAL CHECK
+#
+# Entry happens at the CLOSE of the
+# signal candle.
 # ============================================
 
 def check_signal(ticker, df):
@@ -339,7 +356,7 @@ def check_signal(ticker, df):
     if previous_time.date() != signal_time.date():
         return
 
-    # Ignore before 10:00.
+    # Ignore everything before 10:00.
     if signal_time.time() < START_TIME:
         return
 
@@ -347,24 +364,56 @@ def check_signal(ticker, df):
     # VWAP CROSS
     # ========================================
 
-    long_signal = (
+    long_cross = (
         previous["close"] <= previous["vwap"]
         and signal["close"] > signal["vwap"]
     )
 
-    short_signal = (
+    short_cross = (
         previous["close"] >= previous["vwap"]
         and signal["close"] < signal["vwap"]
     )
 
-    if not long_signal and not short_signal:
+    if not long_cross and not short_cross:
         return
+
+    # ========================================
+    # VWAP DISTANCE FILTER
+    # ========================================
+
+    signal_close = float(signal["close"])
+    signal_vwap = float(signal["vwap"])
+
+    if signal_vwap == 0:
+        return
+
+    vwap_distance_pct = (
+        abs(signal_close - signal_vwap)
+        / abs(signal_vwap)
+        * 100
+    )
+
+    distance_ok = (
+        vwap_distance_pct
+        >= VWAP_DISTANCE_THRESHOLD
+    )
 
     direction = (
         "LONG"
-        if long_signal
+        if long_cross
         else "SHORT"
     )
+
+    # ========================================
+    # EMA9 ENTRY FILTER
+    # ========================================
+
+    signal_ema9 = float(signal["ema9"])
+
+    if direction == "LONG":
+        ema_valid = signal_close > signal_ema9
+    else:
+        ema_valid = signal_close < signal_ema9
 
     print()
     print("========================================")
@@ -374,130 +423,207 @@ def check_signal(ticker, df):
     print(f"Signal time:     {signal_time}")
     print(f"Previous close:  {previous['close']:.4f}")
     print(f"Previous VWAP:   {previous['vwap']:.4f}")
-    print(f"Signal close:    {signal['close']:.4f}")
-    print(f"Signal VWAP:     {signal['vwap']:.4f}")
-    print(f"Signal EMA9:     {signal['ema9']:.4f}")
-    print(f"Direction:       {direction}")
-    print("Waiting for NEXT 5-minute candle.")
-    print("========================================")
-
-    # Store the signal.
-    pending_signals[ticker] = {
-        "direction": direction,
-        "signal_time": signal_time,
-        "signal_ema9": float(
-            signal["ema9"]
-        ),
-    }
-
-
-# ============================================
-# NEXT-CANDLE ENTRY TEST
-# ============================================
-
-def process_pending_entry(
-    ticker,
-    current_candle
-):
-
-    if ticker not in pending_signals:
-        return
-
-    pending = pending_signals.pop(
-        ticker
-    )
-
-    direction = pending["direction"]
-
-    signal_time = pending[
-        "signal_time"
-    ]
-
-    signal_ema9 = pending[
-        "signal_ema9"
-    ]
-
-    entry_time = pd.Timestamp(
-        current_candle["time"]
-    )
-
-    entry_open = float(
-        current_candle["open"]
-    )
-
-    # Never carry a signal overnight.
-    if entry_time.date() != signal_time.date():
-        print(
-            f"{ticker}: pending signal "
-            f"discarded — next candle is "
-            f"next trading day."
-        )
-        return
-
-    # Entry itself must be after 10:00.
-    if entry_time.time() < START_TIME:
-        return
-
-    print()
-    print("========================================")
-    print("NEXT-CANDLE ENTRY TEST")
-    print("========================================")
-    print(f"Ticker:          {ticker}")
-    print(f"Signal time:     {signal_time}")
-    print(f"Entry time:      {entry_time}")
-    print(f"Direction:       {direction}")
+    print(f"Signal close:    {signal_close:.4f}")
+    print(f"Signal VWAP:     {signal_vwap:.4f}")
+    print(f"VWAP distance:   {vwap_distance_pct:.4f}%")
+    print(f"Required:        {VWAP_DISTANCE_THRESHOLD:.2f}%")
     print(f"Signal EMA9:     {signal_ema9:.4f}")
-    print(f"Next candle OPEN:{entry_open:.4f}")
+    print(f"Direction:       {direction}")
 
-    if direction == "LONG":
-
-        valid = (
-            entry_open > signal_ema9
-        )
-
-        print(
-            f"Test: {entry_open:.4f} "
-            f"> {signal_ema9:.4f}"
-        )
-
-    else:
-
-        valid = (
-            entry_open < signal_ema9
-        )
-
-        print(
-            f"Test: {entry_open:.4f} "
-            f"< {signal_ema9:.4f}"
-        )
-
-    if not valid:
-
+    if not distance_ok:
         print("ENTRY: REJECTED")
-        print(
-            "Reason: EMA9 entry filter failed."
-        )
+        print("Reason: VWAP distance filter failed.")
         print("========================================")
-
         return
 
-    print("ENTRY: VALID")
+    if not ema_valid:
+        print("ENTRY: REJECTED")
+        print("Reason: EMA9 entry filter failed.")
+        print("========================================")
+        return
+
+    # ========================================
+    # VALID ENTRY
+    #
+    # Entry price = signal candle CLOSE.
+    # ========================================
+
+    entry_time = signal_time
+    entry_price = signal_close
+
+    print("VWAP DISTANCE:  VALID")
+    print("EMA9 FILTER:    VALID")
+    print("ENTRY:          VALID")
+    print(f"Entry time:     {entry_time}")
+    print(f"Entry price:    {entry_price:.4f}")
+    print("========================================")
+
+    # Store every valid entry separately.
+    # No one-trade-per-ticker restriction.
+    active_entries[ticker].append(
+        {
+            "direction": direction,
+            "entry_time": entry_time,
+            "entry_price": entry_price,
+            "entry_ema9": signal_ema9,
+        }
+    )
+
+    # ========================================
+    # ORDER EXECUTION
+    # ========================================
 
     if not ORDERS_ENABLED:
 
         print()
         print("PAPER ENTRY DISABLED")
         print(
-            "Signal is valid, but no order "
-            "was submitted."
+            "Valid signal recorded, "
+            "but no option order was submitted."
         )
         print("========================================")
 
         return
 
-    # Orders intentionally disabled in this version.
-    # We are first verifying the 5-minute
-    # signals against TradingView.
+    # Actual option order execution will be
+    # enabled after signal verification.
+    #
+    # DO NOT add an order here yet.
+
+
+# ============================================
+# EMA9 EXIT CHECK
+#
+# IMPORTANT:
+# Entry happens at the signal candle CLOSE.
+# Therefore the signal candle itself is NOT
+# allowed to trigger the exit.
+#
+# Exit checking starts with the NEXT
+# completed 5-minute candle.
+# ============================================
+
+def check_exits(ticker, current_candle, strategy_df):
+
+    if not active_entries[ticker]:
+        return
+
+    current_time = pd.Timestamp(
+        current_candle["time"]
+    )
+
+    current_close = float(
+        current_candle["close"]
+    )
+
+    current_ema9 = float(
+        strategy_df.iloc[-1]["ema9"]
+    )
+
+    remaining_entries = []
+
+    for entry in active_entries[ticker]:
+
+        entry_time = pd.Timestamp(
+            entry["entry_time"]
+        )
+
+        direction = entry["direction"]
+
+        # Never carry positions overnight.
+        if entry_time.date() != current_time.date():
+
+            remaining_entries.append(entry)
+            continue
+
+        # Do not check the entry candle itself.
+        if current_time <= entry_time:
+
+            remaining_entries.append(entry)
+            continue
+
+        should_exit = False
+
+        if direction == "LONG":
+
+            if current_close < current_ema9:
+                should_exit = True
+
+        elif direction == "SHORT":
+
+            if current_close > current_ema9:
+                should_exit = True
+
+        if should_exit:
+
+            print()
+            print("========================================")
+            print("EMA9 EXIT SIGNAL")
+            print("========================================")
+            print(f"Ticker:       {ticker}")
+            print(f"Direction:    {direction}")
+            print(f"Entry time:   {entry_time}")
+            print(f"Entry price:  {entry['entry_price']:.4f}")
+            print(f"Exit time:    {current_time}")
+            print(f"Exit price:   {current_close:.4f}")
+            print(f"EMA9:         {current_ema9:.4f}")
+            print("Exit reason:  EMA9")
+            print("========================================")
+
+            # Actual option exit order will be added
+            # after signal verification.
+
+        else:
+
+            remaining_entries.append(entry)
+
+    active_entries[ticker] = remaining_entries
+
+
+# ============================================
+# END-OF-DAY EXIT
+#
+# Final 5-minute candle begins at 15:55
+# and closes at approximately 16:00.
+# ============================================
+
+def check_end_of_day(ticker, current_candle):
+
+    current_time = pd.Timestamp(
+        current_candle["time"]
+    )
+
+    if current_time.hour != 15:
+        return
+
+    if current_time.minute != 55:
+        return
+
+    if not active_entries[ticker]:
+        return
+
+    current_close = float(
+        current_candle["close"]
+    )
+
+    print()
+    print("========================================")
+    print("END OF DAY EXIT")
+    print("========================================")
+    print(f"Ticker:       {ticker}")
+    print(f"Exit time:    {current_time}")
+    print(f"Exit price:   {current_close:.4f}")
+    print(
+        f"Positions:    "
+        f"{len(active_entries[ticker])}"
+    )
+    print("Exit reason:  EOD")
+    print("========================================")
+
+    # Actual option exit orders will be added
+    # after signal verification.
+
+    active_entries[ticker] = []
 
 
 # ============================================
@@ -533,6 +659,7 @@ async def handle_bar(bar):
     )
 
     if timestamp.tzinfo is None:
+
         timestamp = timestamp.tz_localize(
             "UTC"
         )
@@ -606,16 +733,6 @@ async def handle_bar(bar):
     }
 
     # ========================================
-    # CHECK WHETHER THIS IS THE NEXT CANDLE
-    # FOR A PREVIOUS SIGNAL
-    # ========================================
-
-    process_pending_entry(
-        ticker,
-        candle
-    )
-
-    # ========================================
     # ADD COMPLETED 5-MIN CANDLE
     # ========================================
 
@@ -638,6 +755,7 @@ async def handle_bar(bar):
 
     # ========================================
     # EMA9
+    # Source = OPEN
     # ========================================
 
     strategy_df["ema9"] = (
@@ -651,6 +769,7 @@ async def handle_bar(bar):
 
     # ========================================
     # SESSION VWAP
+    # Source = OPEN
     # ========================================
 
     strategy_df["date"] = (
@@ -688,7 +807,26 @@ async def handle_bar(bar):
     )
 
     # ========================================
-    # CHECK NEW VWAP SIGNAL
+    # FIRST CHECK EXISTING EXITS
+    # ========================================
+
+    check_exits(
+        ticker,
+        candle,
+        strategy_df
+    )
+
+    # ========================================
+    # END OF DAY
+    # ========================================
+
+    check_end_of_day(
+        ticker,
+        candle
+    )
+
+    # ========================================
+    # THEN CHECK FOR NEW ENTRY
     # ========================================
 
     check_signal(
