@@ -50,13 +50,12 @@ TICKERS = [
 TIMEZONE = ZoneInfo("America/New_York")
 
 START_TIME = pd.Timestamp("10:00").time()
-
 EOD_TIME = pd.Timestamp("15:59").time()
 
 CONTRACTS = 5
 
+# SAFETY: PAPER ONLY
 PAPER_MODE = True
-
 ORDERS_ENABLED = True
 
 EMA_LENGTH = 9
@@ -73,7 +72,6 @@ if not PAPER_MODE:
     raise RuntimeError(
         "SAFETY STOP: PAPER_MODE must remain True."
     )
-
 
 historical_client = StockHistoricalDataClient(
     API_KEY,
@@ -113,32 +111,18 @@ one_minute_history = {
     for ticker in TICKERS
 }
 
-
-# Pending VWAP signal waiting for NEXT candle.
+# VWAP signal waiting for the NEXT candle.
 pending_signals = {}
 
-
-# Paper option positions opened by this bot.
-#
-# Each entry:
-# {
-#   "ticker": ...,
-#   "direction": ...,
-#   "option_symbol": ...,
-#   "qty": ...,
-#   "entry_time": ...,
-#   "entry_underlying": ...,
-#   "entry_ema9": ...
-# }
+# Options opened by this bot.
 open_trades = []
 
-
-# Prevent processing the same completed candle twice.
+# Prevent duplicate candle processing.
 last_processed_time = {}
 
 
 # ============================================
-# HISTORICAL DATA
+# LOAD TODAY'S 1-MINUTE HISTORY
 # ============================================
 
 def load_today_history():
@@ -184,7 +168,9 @@ def load_today_history():
 
     if "symbol" in df.columns:
         df = df.rename(
-            columns={"symbol": "ticker"}
+            columns={
+                "symbol": "ticker"
+            }
         )
 
     df["timestamp"] = pd.to_datetime(
@@ -199,7 +185,7 @@ def load_today_history():
 
     df = df.rename(
         columns={
-            "timestamp": "time",
+            "timestamp": "time"
         }
     )
 
@@ -231,19 +217,28 @@ def load_today_history():
         )
 
         print(
-            f"{ticker:5s}: {count:,}"
+            f"{ticker:5s}: {count}"
         )
 
     return df
 
 
 # ============================================
-# INDICATORS
+# CALCULATE EMA9 + SESSION VWAP
 # ============================================
 
 def calculate_indicators(df):
 
     df = df.copy()
+
+    df = df.sort_values(
+        "time"
+    ).reset_index(drop=True)
+
+    # ----------------------------------------
+    # EMA9
+    # Source = OPEN
+    # ----------------------------------------
 
     df["ema9"] = (
         df["open"]
@@ -253,6 +248,11 @@ def calculate_indicators(df):
         )
         .mean()
     )
+
+    # ----------------------------------------
+    # SESSION VWAP
+    # Source = OPEN
+    # ----------------------------------------
 
     df["date"] = (
         df["time"].dt.date
@@ -294,47 +294,62 @@ def find_option_contract(
     entry_date
 ):
 
-    option_type = (
-        ContractType.CALL
-        if direction == "LONG"
-        else ContractType.PUT
-    )
+    if direction == "LONG":
+        option_type = ContractType.CALL
+    else:
+        option_type = ContractType.PUT
 
-    # Look for contracts expiring today or later.
-    request = GetOptionContractsRequest(
-        underlying_symbols=[ticker],
-        status=AssetStatus.ACTIVE,
-        type=option_type,
-        expiration_date_gte=entry_date,
-        limit=10000,
-    )
+    try:
 
-    response = trading_client.get_option_contracts(
-        request
-    )
-
-    contracts = response.option_contracts
-
-    if not contracts:
-        print(
-            f"NO OPTION CONTRACT FOUND: {ticker}"
+        request = GetOptionContractsRequest(
+            underlying_symbols=[ticker],
+            status=AssetStatus.ACTIVE,
+            type=option_type,
+            expiration_date_gte=entry_date,
+            limit=10000,
         )
+
+        response = trading_client.get_option_contracts(
+            request
+        )
+
+        contracts = response.option_contracts
+
+    except Exception as e:
+
+        print()
+        print("OPTION CONTRACT LOOKUP FAILED")
+        print(f"{ticker}: {e}")
+
         return None
 
-    # Only tradable contracts.
+    if not contracts:
+
+        print(
+            f"NO OPTION CONTRACTS FOUND: {ticker}"
+        )
+
+        return None
+
     contracts = [
-        c for c in contracts
+        c
+        for c in contracts
         if c.tradable
     ]
 
     if not contracts:
+
         print(
-            f"NO TRADABLE OPTION FOUND: {ticker}"
+            f"NO TRADABLE OPTIONS FOUND: {ticker}"
         )
+
         return None
 
-    # Nearest expiration on/after entry date.
-    expirations = sorted(
+    # ----------------------------------------
+    # Nearest expiration
+    # ----------------------------------------
+
+    valid_expirations = sorted(
         set(
             c.expiration_date
             for c in contracts
@@ -342,21 +357,32 @@ def find_option_contract(
         )
     )
 
-    if not expirations:
+    if not valid_expirations:
+
         print(
             f"NO VALID EXPIRATION: {ticker}"
         )
+
         return None
 
-    nearest_expiration = expirations[0]
+    nearest_expiration = (
+        valid_expirations[0]
+    )
 
     contracts = [
-        c for c in contracts
+        c
+        for c in contracts
         if c.expiration_date
         == nearest_expiration
     ]
 
-    # Strike closest to underlying entry price.
+    if not contracts:
+        return None
+
+    # ----------------------------------------
+    # Strike closest to underlying
+    # ----------------------------------------
+
     contract = min(
         contracts,
         key=lambda c: abs(
@@ -382,13 +408,30 @@ def submit_paper_entry(
 
     print()
     print("========================================")
-    print("PAPER ENTRY CHECK")
+    print("PAPER ENTRY")
     print("========================================")
-    print(f"Ticker:          {ticker}")
-    print(f"Direction:       {direction}")
-    print(f"Entry time:      {entry_time}")
-    print(f"Underlying open: {entry_price:.4f}")
-    print(f"Signal EMA9:     {signal_ema9:.4f}")
+
+    print(
+        f"Ticker:          {ticker}"
+    )
+
+    print(
+        f"Direction:       {direction}"
+    )
+
+    print(
+        f"Entry time:      {entry_time}"
+    )
+
+    print(
+        f"Underlying open: "
+        f"{entry_price:.4f}"
+    )
+
+    print(
+        f"Signal EMA9:     "
+        f"{signal_ema9:.4f}"
+    )
 
     contract = find_option_contract(
         ticker=ticker,
@@ -398,15 +441,20 @@ def submit_paper_entry(
     )
 
     if contract is None:
+
         print("ENTRY: REJECTED")
-        print("Reason: No tradable option contract.")
+        print(
+            "Reason: No tradable option."
+        )
         print("========================================")
+
         return
 
     option_symbol = contract.symbol
 
     print(
-        f"Option:          {option_symbol}"
+        f"Option:          "
+        f"{option_symbol}"
     )
 
     print(
@@ -420,11 +468,22 @@ def submit_paper_entry(
     )
 
     print(
-        f"Contracts:       {CONTRACTS}"
+        f"Contracts:       "
+        f"{CONTRACTS}"
     )
 
     print("Order:            BUY")
     print("Mode:             PAPER")
+
+    if not ORDERS_ENABLED:
+
+        print(
+            "ENTRY BLOCKED: orders disabled."
+        )
+
+        print("========================================")
+
+        return
 
     try:
 
@@ -442,11 +501,15 @@ def submit_paper_entry(
 
         print()
         print("PAPER ORDER SUBMITTED")
+
         print(
-            f"Order ID:         {order.id}"
+            f"Order ID:         "
+            f"{order.id}"
         )
+
         print(
-            f"Status:           {order.status}"
+            f"Status:           "
+            f"{order.status}"
         )
 
         open_trades.append(
@@ -471,7 +534,7 @@ def submit_paper_entry(
 
 
 # ============================================
-# CLOSE PAPER OPTION
+# CLOSE PAPER POSITION
 # ============================================
 
 def close_paper_trade(
@@ -485,26 +548,40 @@ def close_paper_trade(
     print("========================================")
     print("PAPER EXIT")
     print("========================================")
+
     print(
-        f"Ticker:       {trade['ticker']}"
+        f"Ticker:       "
+        f"{trade['ticker']}"
     )
+
     print(
-        f"Direction:    {trade['direction']}"
+        f"Direction:    "
+        f"{trade['direction']}"
     )
+
     print(
-        f"Option:       {trade['option_symbol']}"
+        f"Option:       "
+        f"{trade['option_symbol']}"
     )
+
     print(
-        f"Contracts:    {trade['qty']}"
+        f"Contracts:    "
+        f"{trade['qty']}"
     )
+
     print(
-        f"Exit time:    {exit_time}"
+        f"Exit time:    "
+        f"{exit_time}"
     )
+
     print(
-        f"Underlying:   {underlying_close:.4f}"
+        f"Underlying:   "
+        f"{underlying_close:.4f}"
     )
+
     print(
-        f"Reason:       {reason}"
+        f"Reason:       "
+        f"{reason}"
     )
 
     try:
@@ -520,26 +597,35 @@ def close_paper_trade(
             close_options=close_request
         )
 
-        print("PAPER EXIT SUBMITTED")
         print(
-            f"Order ID:     {order.id}"
+            "PAPER EXIT SUBMITTED"
         )
+
         print(
-            f"Status:       {order.status}"
+            f"Order ID:     "
+            f"{order.id}"
+        )
+
+        print(
+            f"Status:       "
+            f"{order.status}"
         )
 
         return True
 
     except Exception as e:
 
-        print("PAPER EXIT FAILED")
+        print(
+            "PAPER EXIT FAILED"
+        )
+
         print(str(e))
 
         return False
 
 
 # ============================================
-# CHECK EXIT CONDITIONS
+# MANAGE EXISTING PAPER TRADES
 # ============================================
 
 def check_open_trades(
@@ -550,7 +636,9 @@ def check_open_trades(
     if not open_trades:
         return
 
-    current_time = current_candle["time"]
+    current_time = (
+        current_candle["time"]
+    )
 
     current_close = float(
         current_candle["close"]
@@ -567,26 +655,32 @@ def check_open_trades(
         if trade["ticker"] != ticker:
             continue
 
-        # Never use the entry candle to exit.
+        # Never exit on the entry candle.
         if current_time <= trade["entry_time"]:
             continue
 
         exit_reason = None
 
-        # Long option = underlying LONG.
+        # ------------------------------------
+        # EMA9 EXIT
+        # ------------------------------------
+
         if trade["direction"] == "LONG":
 
             if current_close < current_ema9:
                 exit_reason = "EMA9"
 
-        # Short option = underlying SHORT.
         else:
 
             if current_close > current_ema9:
                 exit_reason = "EMA9"
 
-        # End of day.
-        if current_time.time() == EOD_TIME:
+        # ------------------------------------
+        # EOD EXIT
+        # ------------------------------------
+
+        if current_time.time() >= EOD_TIME:
+
             exit_reason = "EOD"
 
         if exit_reason is None:
@@ -600,16 +694,22 @@ def check_open_trades(
         )
 
         if success:
-            trades_to_remove.append(trade)
+
+            trades_to_remove.append(
+                trade
+            )
 
     for trade in trades_to_remove:
 
         if trade in open_trades:
-            open_trades.remove(trade)
+
+            open_trades.remove(
+                trade
+            )
 
 
 # ============================================
-# PROCESS ONE COMPLETED 1-MINUTE CANDLE
+# PROCESS COMPLETED 1-MINUTE CANDLE
 # ============================================
 
 def process_completed_candle(
@@ -625,14 +725,23 @@ def process_completed_candle(
 
     current_time = current["time"]
 
-    # Prevent duplicate processing.
-    if last_processed_time.get(ticker) == current_time:
+    # ----------------------------------------
+    # Prevent duplicate processing
+    # ----------------------------------------
+
+    if (
+        last_processed_time.get(ticker)
+        == current_time
+    ):
+
         return
 
-    last_processed_time[ticker] = current_time
+    last_processed_time[ticker] = (
+        current_time
+    )
 
     # ----------------------------------------
-    # FIRST: MANAGE EXISTING POSITIONS
+    # Manage existing trades first
     # ----------------------------------------
 
     check_open_trades(
@@ -641,59 +750,77 @@ def process_completed_candle(
     )
 
     # ----------------------------------------
-    # SECOND: CHECK PENDING SIGNAL
+    # CHECK PENDING SIGNAL
     # ----------------------------------------
 
     if ticker in pending_signals:
 
-        signal = pending_signals.pop(ticker)
+        signal = pending_signals.pop(
+            ticker
+        )
 
-        direction = signal["direction"]
+        direction = signal[
+            "direction"
+        ]
 
-        signal_ema9 = signal["ema9"]
+        signal_ema9 = float(
+            signal["ema9"]
+        )
 
         next_open = float(
             current["open"]
         )
 
-        valid = False
+        # ------------------------------------
+        # ENTRY FILTER
+        # ------------------------------------
 
         if direction == "LONG":
 
             valid = (
-                next_open > signal_ema9
+                next_open
+                > signal_ema9
             )
 
         else:
 
             valid = (
-                next_open < signal_ema9
+                next_open
+                < signal_ema9
             )
 
         print()
         print("========================================")
         print("NEXT-CANDLE ENTRY TEST")
         print("========================================")
-        print(f"Ticker:          {ticker}")
+
+        print(
+            f"Ticker:          {ticker}"
+        )
+
         print(
             f"Signal time:     "
             f"{signal['time']}"
         )
+
         print(
             f"Entry time:      "
             f"{current_time}"
         )
+
         print(
             f"Direction:       "
             f"{direction}"
         )
+
         print(
             f"Signal EMA9:     "
             f"{signal_ema9:.4f}"
         )
+
         print(
-            f"Next candle OPEN:"
-            f" {next_open:.4f}"
+            f"Next candle OPEN: "
+            f"{next_open:.4f}"
         )
 
         if direction == "LONG":
@@ -714,7 +841,9 @@ def process_completed_candle(
 
         if valid:
 
-            print("ENTRY:            VALID")
+            print(
+                "ENTRY:            VALID"
+            )
 
             submit_paper_entry(
                 ticker=ticker,
@@ -726,24 +855,36 @@ def process_completed_candle(
 
         else:
 
-            print("ENTRY:            REJECTED")
             print(
-                "Reason: EMA9 entry filter failed."
+                "ENTRY:            REJECTED"
             )
 
-        print("========================================")
+            print(
+                "Reason: EMA9 "
+                "entry filter failed."
+            )
+
+        print(
+            "========================================"
+        )
 
     # ----------------------------------------
-    # THIRD: CREATE NEW VWAP SIGNAL
+    # Do not create new signals before 10:00
     # ----------------------------------------
 
-    # Don't create a new signal before 10:00.
     if current_time.time() < START_TIME:
         return
 
-    # No signals after the final candle.
+    # ----------------------------------------
+    # No new signals at/after EOD
+    # ----------------------------------------
+
     if current_time.time() >= EOD_TIME:
         return
+
+    # ----------------------------------------
+    # VWAP CROSS
+    # ----------------------------------------
 
     long_signal = (
         previous["close"]
@@ -778,27 +919,48 @@ def process_completed_candle(
     print("========================================")
     print("VWAP SIGNAL")
     print("========================================")
-    print(f"Ticker:       {ticker}")
-    print(f"Signal time:  {current_time}")
-    print(f"Direction:    {direction}")
+
+    print(
+        f"Ticker:       {ticker}"
+    )
+
+    print(
+        f"Signal time:  "
+        f"{current_time}"
+    )
+
+    print(
+        f"Direction:    "
+        f"{direction}"
+    )
+
     print(
         f"Close:        "
         f"{float(current['close']):.4f}"
     )
+
     print(
         f"VWAP:         "
         f"{float(current['vwap']):.4f}"
     )
+
     print(
         f"EMA9:         "
         f"{signal_ema9:.4f}"
     )
+
     print(
         "Waiting for NEXT 1-minute candle."
     )
-    print("========================================")
 
-    # Store signal for exactly the next candle.
+    print(
+        "========================================"
+    )
+
+    # ----------------------------------------
+    # Save signal for NEXT candle
+    # ----------------------------------------
+
     pending_signals[ticker] = {
         "time": current_time,
         "direction": direction,
@@ -822,6 +984,7 @@ async def handle_bar(bar):
     )
 
     if timestamp.tzinfo is None:
+
         timestamp = timestamp.tz_localize(
             "UTC"
         )
@@ -840,16 +1003,21 @@ async def handle_bar(bar):
         "volume": float(bar.volume),
     }
 
-    one_minute_history[ticker].append(
-        record
-    )
+    one_minute_history[
+        ticker
+    ].append(record)
 
-    one_minute_history[ticker] = (
-        one_minute_history[ticker][-1000:]
-    )
+    # Keep enough history for EMA9/VWAP.
+    one_minute_history[
+        ticker
+    ] = one_minute_history[
+        ticker
+    ][-1000:]
 
     strategy_df = pd.DataFrame(
-        one_minute_history[ticker]
+        one_minute_history[
+            ticker
+        ]
     )
 
     strategy_df = calculate_indicators(
@@ -869,33 +1037,62 @@ async def handle_bar(bar):
 async def main():
 
     # ----------------------------------------
-    # Load today's history
+    # 1. Load history
     # ----------------------------------------
 
     raw_data = load_today_history()
 
     # ----------------------------------------
-    # Calculate indicators
+    # 2. Calculate indicators PER TICKER
+    #
+    # Avoid pandas groupby.apply entirely.
     # ----------------------------------------
 
-    strategy_data = (
-        raw_data
-        .groupby("ticker", group_keys=False)
-        .apply(
-            calculate_indicators,
-            include_groups=True
+    strategy_data_parts = []
+
+    for ticker in TICKERS:
+
+        ticker_data = raw_data[
+            raw_data["ticker"] == ticker
+        ].copy()
+
+        if ticker_data.empty:
+            continue
+
+        ticker_data = calculate_indicators(
+            ticker_data
         )
-        .reset_index(drop=True)
+
+        strategy_data_parts.append(
+            ticker_data
+        )
+
+    if not strategy_data_parts:
+
+        raise RuntimeError(
+            "No strategy data was created."
+        )
+
+    strategy_data = pd.concat(
+        strategy_data_parts,
+        ignore_index=True
     )
 
+    strategy_data = strategy_data.sort_values(
+        ["ticker", "time"]
+    ).reset_index(drop=True)
+
     print()
-    print("1-minute strategy data ready.")
+    print(
+        "1-minute strategy data ready."
+    )
+
     print(
         f"Rows: {len(strategy_data):,}"
     )
 
     # ----------------------------------------
-    # Seed history
+    # 3. Seed history
     # ----------------------------------------
 
     for ticker in TICKERS:
@@ -924,7 +1121,9 @@ async def main():
             )
 
     print()
-    print("1-minute history seeded.")
+    print(
+        "1-minute history seeded."
+    )
 
     for ticker in TICKERS:
 
@@ -935,7 +1134,7 @@ async def main():
         )
 
     # ----------------------------------------
-    # Start live IEX stream
+    # 4. LIVE IEX STREAM
     # ----------------------------------------
 
     stream = StockDataStream(
@@ -946,7 +1145,9 @@ async def main():
 
     print()
     print("========================================")
-    print("STARTING LIVE IEX 1-MINUTE STREAM")
+    print(
+        "STARTING LIVE IEX 1-MINUTE STREAM"
+    )
     print("========================================")
 
     for ticker in TICKERS:
@@ -964,4 +1165,5 @@ async def main():
 # ============================================
 
 if __name__ == "__main__":
+
     asyncio.run(main())
