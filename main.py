@@ -1,257 +1,381 @@
 import os
-import time
-from datetime import datetime
+import asyncio
+from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOptionContractsRequest
-from alpaca.trading.enums import AssetStatus, ContractType
+import pandas as pd
 
-from alpaca.data.historical import (
-    StockHistoricalDataClient,
-    OptionHistoricalDataClient,
-)
-from alpaca.data.requests import (
-    StockLatestTradeRequest,
-    OptionLatestQuoteRequest,
-)
+from alpaca.data.live import StockDataStream
 
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+TICKERS = [
+    "AAPL", "AMD", "PLTR", "TSLA", "NVDA",
+    "QQQ", "GOOG", "SPY", "META", "ORCL",
+    "HIMS", "JPM", "NKE", "ASTS"
+]
+
+TIMEFRAME_MINUTES = 5
+START_TIME = dt_time(10, 0)
+
+EMA_LENGTH = 9
+
+CONTRACTS = 5
+OPTION_MULTIPLIER = 100
 
 NY_TZ = ZoneInfo("America/New_York")
 
 
-def main():
+# ============================================================
+# DATA STORAGE
+# ============================================================
 
-    print("========================================")
-    print("OPTIONS TRADING BOT")
-    print("STEP 9 - LIVE OPTION QUOTE TEST")
-    print("========================================")
+one_minute_bars = {
+    ticker: []
+    for ticker in TICKERS
+}
 
-    api_key = os.environ.get("APCA_API_KEY_ID")
-    api_secret = os.environ.get("APCA_API_SECRET_KEY")
+completed_candles = {
+    ticker: []
+    for ticker in TICKERS
+}
+
+
+# ============================================================
+# INDICATOR CALCULATIONS
+# ============================================================
+
+def calculate_indicators(df):
+
+    df = df.copy()
+
+    # EMA9 using OPEN
+    df["ema9"] = (
+        df["open"]
+        .ewm(
+            span=EMA_LENGTH,
+            adjust=False
+        )
+        .mean()
+    )
+
+    # Session VWAP using OPEN
+    df["date"] = df["timestamp"].dt.date
+
+    df["open_volume"] = (
+        df["open"] * df["volume"]
+    )
+
+    df["cumulative_open_volume"] = (
+        df.groupby("date")["open_volume"]
+        .cumsum()
+    )
+
+    df["cumulative_volume"] = (
+        df.groupby("date")["volume"]
+        .cumsum()
+    )
+
+    df["vwap"] = (
+        df["cumulative_open_volume"]
+        /
+        df["cumulative_volume"]
+    )
+
+    return df
+
+
+# ============================================================
+# VWAP SIGNAL
+# ============================================================
+
+def check_signal(df):
+
+    if len(df) < 2:
+        return None
+
+    previous = df.iloc[-2]
+    current = df.iloc[-1]
+
+    current_time = current["timestamp"].time()
+
+    # Ignore everything before 10:00 NY
+    if current_time < START_TIME:
+        return None
+
+    # LONG:
+    # previous close <= previous VWAP
+    # current close > current VWAP
+
+    long_signal = (
+        previous["close"] <= previous["vwap"]
+        and
+        current["close"] > current["vwap"]
+    )
+
+    # SHORT:
+    # previous close >= previous VWAP
+    # current close < current VWAP
+
+    short_signal = (
+        previous["close"] >= previous["vwap"]
+        and
+        current["close"] < current["vwap"]
+    )
+
+    if not long_signal and not short_signal:
+        return None
+
+    direction = (
+        "LONG"
+        if long_signal
+        else
+        "SHORT"
+    )
+
+    return {
+        "direction": direction,
+        "signal_time": current["timestamp"],
+        "signal_close": float(current["close"]),
+        "signal_vwap": float(current["vwap"]),
+        "signal_ema9": float(current["ema9"])
+    }
+
+
+# ============================================================
+# PROCESS COMPLETED 5-MINUTE CANDLE
+# ============================================================
+
+def process_candle(ticker, candle):
+
+    completed_candles[ticker].append(candle)
+
+    # Keep enough history for EMA9/VWAP
+    if len(completed_candles[ticker]) > 500:
+        completed_candles[ticker] = (
+            completed_candles[ticker][-500:]
+        )
+
+    df = pd.DataFrame(
+        completed_candles[ticker]
+    )
+
+    df = calculate_indicators(df)
+
+    # Need at least two completed candles
+    if len(df) < 2:
+        return
+
+    signal = check_signal(df)
+
+    if signal is None:
+        return
+
+    # --------------------------------------------------------
+    # NEXT CANDLE ENTRY PRICE
+    #
+    # We do NOT have the next candle open yet.
+    # Therefore we record the signal and wait.
+    # --------------------------------------------------------
+
+    print("")
+    print("================================================")
+    print("VWAP SIGNAL DETECTED")
+    print("================================================")
+    print(f"Ticker:        {ticker}")
+    print(f"Direction:     {signal['direction']}")
+    print(f"Signal time:   {signal['signal_time']}")
+    print(f"Signal close:  ${signal['signal_close']:.2f}")
+    print(f"VWAP:          ${signal['signal_vwap']:.2f}")
+    print(f"EMA9:          ${signal['signal_ema9']:.2f}")
+    print("Contracts:     5")
+    print("ORDER:         DISABLED")
+    print("================================================")
+    print("")
+
+
+# ============================================================
+# ALPACA LIVE BAR HANDLER
+# ============================================================
+
+async def on_bar(bar):
+
+    ticker = bar.symbol
+
+    if ticker not in TICKERS:
+        return
+
+    timestamp = bar.timestamp.astimezone(NY_TZ)
+
+    # --------------------------------------------------------
+    # Convert incoming 1-minute bar
+    # --------------------------------------------------------
+
+    minute_bar = {
+        "timestamp": timestamp,
+        "open": float(bar.open),
+        "high": float(bar.high),
+        "low": float(bar.low),
+        "close": float(bar.close),
+        "volume": float(bar.volume)
+    }
+
+    one_minute_bars[ticker].append(
+        minute_bar
+    )
+
+    # --------------------------------------------------------
+    # Keep recent history
+    # --------------------------------------------------------
+
+    if len(one_minute_bars[ticker]) > 500:
+        one_minute_bars[ticker] = (
+            one_minute_bars[ticker][-500:]
+        )
+
+    # --------------------------------------------------------
+    # Only process a completed 5-minute block
+    #
+    # Example:
+    # 10:00, 10:01, 10:02, 10:03, 10:04
+    # becomes the 10:00 5-minute candle.
+    # --------------------------------------------------------
+
+    minute = timestamp.minute
+
+    if minute % TIMEFRAME_MINUTES != (
+        TIMEFRAME_MINUTES - 1
+    ):
+        return
+
+    recent = one_minute_bars[ticker][-5:]
+
+    if len(recent) < 5:
+        return
+
+    timestamps = [
+        x["timestamp"]
+        for x in recent
+    ]
+
+    # Make sure these are five consecutive minutes
+    expected_minutes = pd.date_range(
+        start=timestamps[0],
+        periods=5,
+        freq="min",
+        tz=NY_TZ
+    )
+
+    actual_minutes = pd.DatetimeIndex(
+        timestamps
+    )
+
+    if not actual_minutes.equals(
+        expected_minutes
+    ):
+        return
+
+    # --------------------------------------------------------
+    # Build 5-minute candle
+    # --------------------------------------------------------
+
+    candle = {
+        "timestamp": recent[0]["timestamp"],
+        "open": recent[0]["open"],
+        "high": max(
+            x["high"] for x in recent
+        ),
+        "low": min(
+            x["low"] for x in recent
+        ),
+        "close": recent[-1]["close"],
+        "volume": sum(
+            x["volume"] for x in recent
+        )
+    }
+
+    process_candle(
+        ticker,
+        candle
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def run_stream():
+
+    api_key = os.environ.get(
+        "APCA_API_KEY_ID"
+    )
+
+    api_secret = os.environ.get(
+        "APCA_API_SECRET_KEY"
+    )
 
     if not api_key:
-        raise RuntimeError("Missing APCA_API_KEY_ID")
+        raise RuntimeError(
+            "Missing APCA_API_KEY_ID"
+        )
 
     if not api_secret:
-        raise RuntimeError("Missing APCA_API_SECRET_KEY")
+        raise RuntimeError(
+            "Missing APCA_API_SECRET_KEY"
+        )
 
     # SAFETY LOCK
-    if os.environ.get("ALPACA_PAPER", "true").lower() != "true":
+    if os.environ.get(
+        "ALPACA_PAPER",
+        "true"
+    ).lower() != "true":
+
         raise RuntimeError(
             "SAFETY ERROR: ALPACA_PAPER must be true."
         )
 
-    print("Paper trading: ENABLED")
+    print("========================================")
+    print("OPTIONS TRADING BOT")
+    print("STEP 10 - LIVE STRATEGY ENGINE")
+    print("========================================")
+    print("Paper mode: ENABLED")
+    print("Timeframe:   5 minutes")
+    print("Start time:  10:00 NY")
+    print("Contracts:   5")
+    print("Orders:      DISABLED")
+    print("========================================")
+    print("")
 
-    # ----------------------------------------
-    # Clients
-    # ----------------------------------------
-
-    trading_client = TradingClient(
-        api_key,
-        api_secret,
-        paper=True
-    )
-
-    stock_client = StockHistoricalDataClient(
+    stream = StockDataStream(
         api_key,
         api_secret
     )
 
-    option_client = OptionHistoricalDataClient(
-        api_key,
-        api_secret
-    )
-
-    # ----------------------------------------
-    # Account
-    # ----------------------------------------
-
-    account = trading_client.get_account()
-
-    print("\nACCOUNT")
-    print("----------------------------------------")
-    print(f"Status:       {account.status}")
-    print(f"Equity:       ${float(account.equity):,.2f}")
-    print(f"Cash:         ${float(account.cash):,.2f}")
-    print(f"Buying power: ${float(account.buying_power):,.2f}")
-
-    # ----------------------------------------
-    # Get live TSLA price
-    # ----------------------------------------
-
-    stock_request = StockLatestTradeRequest(
-        symbol_or_symbols=["TSLA"]
-    )
-
-    stock_trades = stock_client.get_stock_latest_trade(
-        stock_request
-    )
-
-    tsla_price = float(stock_trades["TSLA"].price)
-
-    print("\nTSLA")
-    print("----------------------------------------")
-    print(f"Underlying price: ${tsla_price:.2f}")
-
-    # ----------------------------------------
-    # Get today's nearest contracts
-    # ----------------------------------------
-
-    today = datetime.now(NY_TZ).date()
-
-    call_request = GetOptionContractsRequest(
-        underlying_symbols=["TSLA"],
-        status=AssetStatus.ACTIVE,
-        type=ContractType.CALL,
-        expiration_date_gte=today,
-        limit=10000
-    )
-
-    put_request = GetOptionContractsRequest(
-        underlying_symbols=["TSLA"],
-        status=AssetStatus.ACTIVE,
-        type=ContractType.PUT,
-        expiration_date_gte=today,
-        limit=10000
-    )
-
-    calls = trading_client.get_option_contracts(
-        call_request
-    ).option_contracts
-
-    puts = trading_client.get_option_contracts(
-        put_request
-    ).option_contracts
-
-    calls = [
-        c for c in calls
-        if c.tradable
-    ]
-
-    puts = [
-        p for p in puts
-        if p.tradable
-    ]
-
-    # ----------------------------------------
-    # Select nearest strike
-    # ----------------------------------------
-
-    nearest_call = min(
-        calls,
-        key=lambda c: (
-            c.expiration_date,
-            abs(float(c.strike_price) - tsla_price)
-        )
-    )
-
-    nearest_put = min(
-        puts,
-        key=lambda p: (
-            p.expiration_date,
-            abs(float(p.strike_price) - tsla_price)
-        )
-    )
-
-    call_symbol = nearest_call.symbol
-    put_symbol = nearest_put.symbol
-
-    print("\nSELECTED CONTRACTS")
-    print("----------------------------------------")
-    print(
-        f"CALL: {call_symbol} | "
-        f"Strike=${float(nearest_call.strike_price):.2f} | "
-        f"Expiry={nearest_call.expiration_date}"
+    stream.subscribe_bars(
+        on_bar,
+        *TICKERS
     )
 
     print(
-        f"PUT:  {put_symbol} | "
-        f"Strike=${float(nearest_put.strike_price):.2f} | "
-        f"Expiry={nearest_put.expiration_date}"
+        "Subscribed to live bars for "
+        f"{len(TICKERS)} tickers."
     )
 
-    # ----------------------------------------
-    # Get live option quotes
-    # ----------------------------------------
-
-    print("\nLIVE OPTION QUOTES")
-    print("----------------------------------------")
-
-    quote_request = OptionLatestQuoteRequest(
-        symbol_or_symbols=[
-            call_symbol,
-            put_symbol
-        ]
+    print(
+        "Waiting for completed 5-minute candles..."
     )
 
-    quotes = option_client.get_option_latest_quote(
-        quote_request
+    await stream._run_forever()
+
+
+def main():
+
+    asyncio.run(
+        run_stream()
     )
-
-    # ----------------------------------------
-    # Display CALL quote
-    # ----------------------------------------
-
-    call_quote = quotes[call_symbol]
-
-    print("\nCALL")
-    print("----------------------------------------")
-    print(f"Symbol:       {call_symbol}")
-    print(f"Bid:          ${float(call_quote.bid_price):.2f}")
-    print(f"Ask:          ${float(call_quote.ask_price):.2f}")
-    print(f"Bid size:     {call_quote.bid_size}")
-    print(f"Ask size:     {call_quote.ask_size}")
-    print(f"Timestamp:    {call_quote.timestamp}")
-
-    # ----------------------------------------
-    # Display PUT quote
-    # ----------------------------------------
-
-    put_quote = quotes[put_symbol]
-
-    print("\nPUT")
-    print("----------------------------------------")
-    print(f"Symbol:       {put_symbol}")
-    print(f"Bid:          ${float(put_quote.bid_price):.2f}")
-    print(f"Ask:          ${float(put_quote.ask_price):.2f}")
-    print(f"Bid size:     {put_quote.bid_size}")
-    print(f"Ask size:     {put_quote.ask_size}")
-    print(f"Timestamp:    {put_quote.timestamp}")
-
-    # ----------------------------------------
-    # Calculate 25-contract notional
-    # ----------------------------------------
-
-    call_ask = float(call_quote.ask_price)
-    put_ask = float(put_quote.ask_price)
-
-    call_cost = call_ask * 100 * 25
-    put_cost = put_ask * 100 * 25
-
-    print("\n25-CONTRACT COST")
-    print("----------------------------------------")
-    print(f"CALL ask cost: ${call_cost:,.2f}")
-    print(f"PUT ask cost:  ${put_cost:,.2f}")
-
-    # ----------------------------------------
-    # Safety confirmation
-    # ----------------------------------------
-
-    print("\n========================================")
-    print("STEP 9 COMPLETE")
-    print("========================================")
-    print("Underlying data:       OK")
-    print("Option contracts:      OK")
-    print("Live option quotes:    OK")
-    print("Order submission:      DISABLED")
-    print("NO ORDERS WERE PLACED")
-    print("========================================")
-
-    # Keep Railway service alive.
-    while True:
-        time.sleep(300)
 
 
 if __name__ == "__main__":
