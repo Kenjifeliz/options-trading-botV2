@@ -11,20 +11,6 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 from alpaca.data.live.stock import StockDataStream
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    GetOptionContractsRequest,
-    MarketOrderRequest,
-    ClosePositionRequest,
-)
-from alpaca.trading.enums import (
-    AssetStatus,
-    ContractType,
-    OrderSide,
-    OrderType,
-    TimeInForce,
-)
-
 
 # ============================================
 # SETTINGS
@@ -49,14 +35,14 @@ TICKERS = [
 
 TIMEZONE = ZoneInfo("America/New_York")
 
+TIMEFRAME = "5min"
+
 START_TIME = pd.Timestamp("10:00").time()
-EOD_TIME = pd.Timestamp("15:59").time()
 
 CONTRACTS = 5
 
-# SAFETY: PAPER ONLY
-PAPER_MODE = True
-ORDERS_ENABLED = True
+# KEEP OFF while we verify the 5-minute signals.
+ORDERS_ENABLED = False
 
 EMA_LENGTH = 9
 
@@ -68,61 +54,41 @@ EMA_LENGTH = 9
 API_KEY = os.environ["APCA_API_KEY_ID"]
 API_SECRET = os.environ["APCA_API_SECRET_KEY"]
 
-if not PAPER_MODE:
-    raise RuntimeError(
-        "SAFETY STOP: PAPER_MODE must remain True."
-    )
+PAPER_MODE = (
+    os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+)
+
+
+print("========================================")
+print("OPTIONS TRADING BOT")
+print("========================================")
+print("Timeframe:   5 minutes")
+print("Start time:  10:00 NY")
+print("Data feed:   IEX")
+print(f"Contracts:   {CONTRACTS}")
+print(
+    f"Orders:      "
+    f"{'ENABLED' if ORDERS_ENABLED else 'DISABLED'}"
+)
+print(
+    f"Paper mode:  "
+    f"{'ENABLED' if PAPER_MODE else 'DISABLED'}"
+)
+print("========================================")
+
+
+# ============================================
+# HISTORICAL CLIENT
+# ============================================
 
 historical_client = StockHistoricalDataClient(
     API_KEY,
     API_SECRET
 )
 
-trading_client = TradingClient(
-    API_KEY,
-    API_SECRET,
-    paper=True
-)
-
 
 # ============================================
-# STARTUP
-# ============================================
-
-print("========================================")
-print("OPTIONS TRADING BOT")
-print("STEP 13 - 1-MINUTE PAPER OPTIONS")
-print("========================================")
-print("Paper mode: ENABLED")
-print("Timeframe:   1 minute")
-print("Start time:  10:00 NY")
-print("Data feed:   IEX")
-print(f"Contracts:   {CONTRACTS}")
-print("Orders:      ENABLED - PAPER ONLY")
-print("========================================")
-
-
-# ============================================
-# STATE
-# ============================================
-
-one_minute_history = {
-    ticker: []
-    for ticker in TICKERS
-}
-
-# VWAP signal waiting for the NEXT candle.
-pending_signals = {}
-
-# Options opened by this bot.
-open_trades = []
-
-# Prevent duplicate candle processing.
-last_processed_time = {}
-
-
-# ============================================
-# LOAD TODAY'S 1-MINUTE HISTORY
+# TODAY'S 1-MINUTE HISTORY
 # ============================================
 
 def load_today_history():
@@ -136,6 +102,7 @@ def load_today_history():
         microsecond=0
     )
 
+    # Do not include the currently forming minute.
     end_time = now_ny - timedelta(minutes=1)
 
     print()
@@ -168,9 +135,7 @@ def load_today_history():
 
     if "symbol" in df.columns:
         df = df.rename(
-            columns={
-                "symbol": "ticker"
-            }
+            columns={"symbol": "ticker"}
         )
 
     df["timestamp"] = pd.to_datetime(
@@ -211,695 +176,185 @@ def load_today_history():
     print(f"Tickers: {df['ticker'].nunique()}")
 
     for ticker in TICKERS:
-
         count = len(
             df[df["ticker"] == ticker]
         )
-
         print(
-            f"{ticker:5s}: {count}"
+            f"{ticker:5s}: {count:,}"
         )
 
     return df
 
 
 # ============================================
-# CALCULATE EMA9 + SESSION VWAP
+# BUILD 5-MINUTE DATA
 # ============================================
 
-def calculate_indicators(df):
+def prepare_strategy_data(raw_data):
 
-    df = df.copy()
+    results = []
 
-    df = df.sort_values(
-        "time"
-    ).reset_index(drop=True)
+    for ticker in TICKERS:
 
-    # ----------------------------------------
-    # EMA9
-    # Source = OPEN
-    # ----------------------------------------
+        ticker_df = raw_data[
+            raw_data["ticker"] == ticker
+        ].copy()
 
-    df["ema9"] = (
-        df["open"]
-        .ewm(
-            span=EMA_LENGTH,
-            adjust=False
-        )
-        .mean()
-    )
+        if ticker_df.empty:
+            continue
 
-    # ----------------------------------------
-    # SESSION VWAP
-    # Source = OPEN
-    # ----------------------------------------
-
-    df["date"] = (
-        df["time"].dt.date
-    )
-
-    df["open_volume"] = (
-        df["open"]
-        * df["volume"]
-    )
-
-    df["cumulative_open_volume"] = (
-        df
-        .groupby("date")["open_volume"]
-        .cumsum()
-    )
-
-    df["cumulative_volume"] = (
-        df
-        .groupby("date")["volume"]
-        .cumsum()
-    )
-
-    df["vwap"] = (
-        df["cumulative_open_volume"]
-        / df["cumulative_volume"]
-    )
-
-    return df
-
-
-# ============================================
-# FIND OPTION CONTRACT
-# ============================================
-
-def find_option_contract(
-    ticker,
-    direction,
-    underlying_price,
-    entry_date
-):
-
-    if direction == "LONG":
-        option_type = ContractType.CALL
-    else:
-        option_type = ContractType.PUT
-
-    try:
-
-        request = GetOptionContractsRequest(
-            underlying_symbols=[ticker],
-            status=AssetStatus.ACTIVE,
-            type=option_type,
-            expiration_date_gte=entry_date,
-            limit=10000,
+        ticker_df = ticker_df.sort_values(
+            "time"
         )
 
-        response = trading_client.get_option_contracts(
-            request
+        ticker_df = ticker_df.set_index(
+            "time"
         )
 
-        contracts = response.option_contracts
-
-    except Exception as e:
-
-        print()
-        print("OPTION CONTRACT LOOKUP FAILED")
-        print(f"{ticker}: {e}")
-
-        return None
-
-    if not contracts:
-
-        print(
-            f"NO OPTION CONTRACTS FOUND: {ticker}"
-        )
-
-        return None
-
-    contracts = [
-        c
-        for c in contracts
-        if c.tradable
-    ]
-
-    if not contracts:
-
-        print(
-            f"NO TRADABLE OPTIONS FOUND: {ticker}"
-        )
-
-        return None
-
-    # ----------------------------------------
-    # Nearest expiration
-    # ----------------------------------------
-
-    valid_expirations = sorted(
-        set(
-            c.expiration_date
-            for c in contracts
-            if c.expiration_date >= entry_date
-        )
-    )
-
-    if not valid_expirations:
-
-        print(
-            f"NO VALID EXPIRATION: {ticker}"
-        )
-
-        return None
-
-    nearest_expiration = (
-        valid_expirations[0]
-    )
-
-    contracts = [
-        c
-        for c in contracts
-        if c.expiration_date
-        == nearest_expiration
-    ]
-
-    if not contracts:
-        return None
-
-    # ----------------------------------------
-    # Strike closest to underlying
-    # ----------------------------------------
-
-    contract = min(
-        contracts,
-        key=lambda c: abs(
-            float(c.strike_price)
-            - underlying_price
-        )
-    )
-
-    return contract
-
-
-# ============================================
-# SUBMIT PAPER ENTRY
-# ============================================
-
-def submit_paper_entry(
-    ticker,
-    direction,
-    entry_time,
-    entry_price,
-    signal_ema9
-):
-
-    print()
-    print("========================================")
-    print("PAPER ENTRY")
-    print("========================================")
-
-    print(
-        f"Ticker:          {ticker}"
-    )
-
-    print(
-        f"Direction:       {direction}"
-    )
-
-    print(
-        f"Entry time:      {entry_time}"
-    )
-
-    print(
-        f"Underlying open: "
-        f"{entry_price:.4f}"
-    )
-
-    print(
-        f"Signal EMA9:     "
-        f"{signal_ema9:.4f}"
-    )
-
-    contract = find_option_contract(
-        ticker=ticker,
-        direction=direction,
-        underlying_price=entry_price,
-        entry_date=entry_time.date()
-    )
-
-    if contract is None:
-
-        print("ENTRY: REJECTED")
-        print(
-            "Reason: No tradable option."
-        )
-        print("========================================")
-
-        return
-
-    option_symbol = contract.symbol
-
-    print(
-        f"Option:          "
-        f"{option_symbol}"
-    )
-
-    print(
-        f"Strike:          "
-        f"{float(contract.strike_price):.2f}"
-    )
-
-    print(
-        f"Expiration:      "
-        f"{contract.expiration_date}"
-    )
-
-    print(
-        f"Contracts:       "
-        f"{CONTRACTS}"
-    )
-
-    print("Order:            BUY")
-    print("Mode:             PAPER")
-
-    if not ORDERS_ENABLED:
-
-        print(
-            "ENTRY BLOCKED: orders disabled."
-        )
-
-        print("========================================")
-
-        return
-
-    try:
-
-        order_request = MarketOrderRequest(
-            symbol=option_symbol,
-            qty=CONTRACTS,
-            side=OrderSide.BUY,
-            type=OrderType.MARKET,
-            time_in_force=TimeInForce.DAY,
-        )
-
-        order = trading_client.submit_order(
-            order_request
-        )
-
-        print()
-        print("PAPER ORDER SUBMITTED")
-
-        print(
-            f"Order ID:         "
-            f"{order.id}"
-        )
-
-        print(
-            f"Status:           "
-            f"{order.status}"
-        )
-
-        open_trades.append(
+        five = ticker_df.resample(
+            "5min",
+            origin="start_day"
+        ).agg(
             {
-                "ticker": ticker,
-                "direction": direction,
-                "option_symbol": option_symbol,
-                "qty": CONTRACTS,
-                "entry_time": entry_time,
-                "entry_underlying": entry_price,
-                "entry_ema9": signal_ema9,
+                "ticker": "first",
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
             }
         )
 
-    except Exception as e:
+        five = five.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close"
+            ]
+        )
 
-        print()
-        print("PAPER ORDER FAILED")
-        print(str(e))
+        # ====================================
+        # EMA9
+        # Source = OPEN
+        # ====================================
 
-    print("========================================")
+        five["ema9"] = (
+            five["open"]
+            .ewm(
+                span=EMA_LENGTH,
+                adjust=False
+            )
+            .mean()
+        )
+
+        # ====================================
+        # SESSION VWAP
+        # Source = OPEN
+        # ====================================
+
+        five["date"] = five.index.date
+
+        five["open_volume"] = (
+            five["open"]
+            * five["volume"]
+        )
+
+        five["cumulative_open_volume"] = (
+            five
+            .groupby("date")["open_volume"]
+            .cumsum()
+        )
+
+        five["cumulative_volume"] = (
+            five
+            .groupby("date")["volume"]
+            .cumsum()
+        )
+
+        five["vwap"] = (
+            five["cumulative_open_volume"]
+            / five["cumulative_volume"]
+        )
+
+        five = five.reset_index()
+
+        results.append(five)
+
+    if not results:
+        raise RuntimeError(
+            "No 5-minute strategy data created."
+        )
+
+    result = pd.concat(
+        results,
+        ignore_index=True
+    )
+
+    result = result.sort_values(
+        ["ticker", "time"]
+    ).reset_index(drop=True)
+
+    return result
 
 
 # ============================================
-# CLOSE PAPER POSITION
+# LIVE STRATEGY HISTORY
 # ============================================
 
-def close_paper_trade(
-    trade,
-    reason,
-    exit_time,
-    underlying_close
-):
-
-    print()
-    print("========================================")
-    print("PAPER EXIT")
-    print("========================================")
-
-    print(
-        f"Ticker:       "
-        f"{trade['ticker']}"
-    )
-
-    print(
-        f"Direction:    "
-        f"{trade['direction']}"
-    )
-
-    print(
-        f"Option:       "
-        f"{trade['option_symbol']}"
-    )
-
-    print(
-        f"Contracts:    "
-        f"{trade['qty']}"
-    )
-
-    print(
-        f"Exit time:    "
-        f"{exit_time}"
-    )
-
-    print(
-        f"Underlying:   "
-        f"{underlying_close:.4f}"
-    )
-
-    print(
-        f"Reason:       "
-        f"{reason}"
-    )
-
-    try:
-
-        close_request = ClosePositionRequest(
-            qty=str(trade["qty"])
-        )
-
-        order = trading_client.close_position(
-            symbol_or_asset_id=trade[
-                "option_symbol"
-            ],
-            close_options=close_request
-        )
-
-        print(
-            "PAPER EXIT SUBMITTED"
-        )
-
-        print(
-            f"Order ID:     "
-            f"{order.id}"
-        )
-
-        print(
-            f"Status:       "
-            f"{order.status}"
-        )
-
-        return True
-
-    except Exception as e:
-
-        print(
-            "PAPER EXIT FAILED"
-        )
-
-        print(str(e))
-
-        return False
+five_minute_history = {
+    ticker: []
+    for ticker in TICKERS
+}
 
 
 # ============================================
-# MANAGE EXISTING PAPER TRADES
+# PENDING VWAP SIGNALS
 # ============================================
 
-def check_open_trades(
-    ticker,
-    current_candle
-):
+pending_signals = {}
 
-    if not open_trades:
+
+# ============================================
+# SIGNAL CHECK
+# ============================================
+
+def check_signal(ticker, df):
+
+    if len(df) < 3:
         return
 
-    current_time = (
-        current_candle["time"]
+    previous = df.iloc[-2]
+    signal = df.iloc[-1]
+
+    previous_time = pd.Timestamp(
+        previous["time"]
     )
 
-    current_close = float(
-        current_candle["close"]
+    signal_time = pd.Timestamp(
+        signal["time"]
     )
 
-    current_ema9 = float(
-        current_candle["ema9"]
-    )
-
-    trades_to_remove = []
-
-    for trade in open_trades:
-
-        if trade["ticker"] != ticker:
-            continue
-
-        # Never exit on the entry candle.
-        if current_time <= trade["entry_time"]:
-            continue
-
-        exit_reason = None
-
-        # ------------------------------------
-        # EMA9 EXIT
-        # ------------------------------------
-
-        if trade["direction"] == "LONG":
-
-            if current_close < current_ema9:
-                exit_reason = "EMA9"
-
-        else:
-
-            if current_close > current_ema9:
-                exit_reason = "EMA9"
-
-        # ------------------------------------
-        # EOD EXIT
-        # ------------------------------------
-
-        if current_time.time() >= EOD_TIME:
-
-            exit_reason = "EOD"
-
-        if exit_reason is None:
-            continue
-
-        success = close_paper_trade(
-            trade=trade,
-            reason=exit_reason,
-            exit_time=current_time,
-            underlying_close=current_close
-        )
-
-        if success:
-
-            trades_to_remove.append(
-                trade
-            )
-
-    for trade in trades_to_remove:
-
-        if trade in open_trades:
-
-            open_trades.remove(
-                trade
-            )
-
-
-# ============================================
-# PROCESS COMPLETED 1-MINUTE CANDLE
-# ============================================
-
-def process_completed_candle(
-    ticker,
-    strategy_df
-):
-
-    if len(strategy_df) < 2:
+    # Must be same trading day.
+    if previous_time.date() != signal_time.date():
         return
 
-    current = strategy_df.iloc[-1]
-    previous = strategy_df.iloc[-2]
-
-    current_time = current["time"]
-
-    # ----------------------------------------
-    # Prevent duplicate processing
-    # ----------------------------------------
-
-    if (
-        last_processed_time.get(ticker)
-        == current_time
-    ):
-
+    # Ignore before 10:00.
+    if signal_time.time() < START_TIME:
         return
 
-    last_processed_time[ticker] = (
-        current_time
-    )
-
-    # ----------------------------------------
-    # Manage existing trades first
-    # ----------------------------------------
-
-    check_open_trades(
-        ticker,
-        current
-    )
-
-    # ----------------------------------------
-    # CHECK PENDING SIGNAL
-    # ----------------------------------------
-
-    if ticker in pending_signals:
-
-        signal = pending_signals.pop(
-            ticker
-        )
-
-        direction = signal[
-            "direction"
-        ]
-
-        signal_ema9 = float(
-            signal["ema9"]
-        )
-
-        next_open = float(
-            current["open"]
-        )
-
-        # ------------------------------------
-        # ENTRY FILTER
-        # ------------------------------------
-
-        if direction == "LONG":
-
-            valid = (
-                next_open
-                > signal_ema9
-            )
-
-        else:
-
-            valid = (
-                next_open
-                < signal_ema9
-            )
-
-        print()
-        print("========================================")
-        print("NEXT-CANDLE ENTRY TEST")
-        print("========================================")
-
-        print(
-            f"Ticker:          {ticker}"
-        )
-
-        print(
-            f"Signal time:     "
-            f"{signal['time']}"
-        )
-
-        print(
-            f"Entry time:      "
-            f"{current_time}"
-        )
-
-        print(
-            f"Direction:       "
-            f"{direction}"
-        )
-
-        print(
-            f"Signal EMA9:     "
-            f"{signal_ema9:.4f}"
-        )
-
-        print(
-            f"Next candle OPEN: "
-            f"{next_open:.4f}"
-        )
-
-        if direction == "LONG":
-
-            print(
-                f"Test:             "
-                f"{next_open:.4f} > "
-                f"{signal_ema9:.4f}"
-            )
-
-        else:
-
-            print(
-                f"Test:             "
-                f"{next_open:.4f} < "
-                f"{signal_ema9:.4f}"
-            )
-
-        if valid:
-
-            print(
-                "ENTRY:            VALID"
-            )
-
-            submit_paper_entry(
-                ticker=ticker,
-                direction=direction,
-                entry_time=current_time,
-                entry_price=next_open,
-                signal_ema9=signal_ema9
-            )
-
-        else:
-
-            print(
-                "ENTRY:            REJECTED"
-            )
-
-            print(
-                "Reason: EMA9 "
-                "entry filter failed."
-            )
-
-        print(
-            "========================================"
-        )
-
-    # ----------------------------------------
-    # Do not create new signals before 10:00
-    # ----------------------------------------
-
-    if current_time.time() < START_TIME:
-        return
-
-    # ----------------------------------------
-    # No new signals at/after EOD
-    # ----------------------------------------
-
-    if current_time.time() >= EOD_TIME:
-        return
-
-    # ----------------------------------------
+    # ========================================
     # VWAP CROSS
-    # ----------------------------------------
+    # ========================================
 
     long_signal = (
-        previous["close"]
-        <= previous["vwap"]
-        and
-        current["close"]
-        > current["vwap"]
+        previous["close"] <= previous["vwap"]
+        and signal["close"] > signal["vwap"]
     )
 
     short_signal = (
-        previous["close"]
-        >= previous["vwap"]
-        and
-        current["close"]
-        < current["vwap"]
+        previous["close"] >= previous["vwap"]
+        and signal["close"] < signal["vwap"]
     )
 
     if not long_signal and not short_signal:
@@ -911,61 +366,155 @@ def process_completed_candle(
         else "SHORT"
     )
 
-    signal_ema9 = float(
-        current["ema9"]
+    print()
+    print("========================================")
+    print("5-MINUTE VWAP SIGNAL")
+    print("========================================")
+    print(f"Ticker:          {ticker}")
+    print(f"Signal time:     {signal_time}")
+    print(f"Previous close:  {previous['close']:.4f}")
+    print(f"Previous VWAP:   {previous['vwap']:.4f}")
+    print(f"Signal close:    {signal['close']:.4f}")
+    print(f"Signal VWAP:     {signal['vwap']:.4f}")
+    print(f"Signal EMA9:     {signal['ema9']:.4f}")
+    print(f"Direction:       {direction}")
+    print("Waiting for NEXT 5-minute candle.")
+    print("========================================")
+
+    # Store the signal.
+    pending_signals[ticker] = {
+        "direction": direction,
+        "signal_time": signal_time,
+        "signal_ema9": float(
+            signal["ema9"]
+        ),
+    }
+
+
+# ============================================
+# NEXT-CANDLE ENTRY TEST
+# ============================================
+
+def process_pending_entry(
+    ticker,
+    current_candle
+):
+
+    if ticker not in pending_signals:
+        return
+
+    pending = pending_signals.pop(
+        ticker
     )
+
+    direction = pending["direction"]
+
+    signal_time = pending[
+        "signal_time"
+    ]
+
+    signal_ema9 = pending[
+        "signal_ema9"
+    ]
+
+    entry_time = pd.Timestamp(
+        current_candle["time"]
+    )
+
+    entry_open = float(
+        current_candle["open"]
+    )
+
+    # Never carry a signal overnight.
+    if entry_time.date() != signal_time.date():
+        print(
+            f"{ticker}: pending signal "
+            f"discarded — next candle is "
+            f"next trading day."
+        )
+        return
+
+    # Entry itself must be after 10:00.
+    if entry_time.time() < START_TIME:
+        return
 
     print()
     print("========================================")
-    print("VWAP SIGNAL")
+    print("NEXT-CANDLE ENTRY TEST")
     print("========================================")
+    print(f"Ticker:          {ticker}")
+    print(f"Signal time:     {signal_time}")
+    print(f"Entry time:      {entry_time}")
+    print(f"Direction:       {direction}")
+    print(f"Signal EMA9:     {signal_ema9:.4f}")
+    print(f"Next candle OPEN:{entry_open:.4f}")
 
-    print(
-        f"Ticker:       {ticker}"
-    )
+    if direction == "LONG":
 
-    print(
-        f"Signal time:  "
-        f"{current_time}"
-    )
+        valid = (
+            entry_open > signal_ema9
+        )
 
-    print(
-        f"Direction:    "
-        f"{direction}"
-    )
+        print(
+            f"Test: {entry_open:.4f} "
+            f"> {signal_ema9:.4f}"
+        )
 
-    print(
-        f"Close:        "
-        f"{float(current['close']):.4f}"
-    )
+    else:
 
-    print(
-        f"VWAP:         "
-        f"{float(current['vwap']):.4f}"
-    )
+        valid = (
+            entry_open < signal_ema9
+        )
 
-    print(
-        f"EMA9:         "
-        f"{signal_ema9:.4f}"
-    )
+        print(
+            f"Test: {entry_open:.4f} "
+            f"< {signal_ema9:.4f}"
+        )
 
-    print(
-        "Waiting for NEXT 1-minute candle."
-    )
+    if not valid:
 
-    print(
-        "========================================"
-    )
+        print("ENTRY: REJECTED")
+        print(
+            "Reason: EMA9 entry filter failed."
+        )
+        print("========================================")
 
-    # ----------------------------------------
-    # Save signal for NEXT candle
-    # ----------------------------------------
+        return
 
-    pending_signals[ticker] = {
-        "time": current_time,
-        "direction": direction,
-        "ema9": signal_ema9,
-    }
+    print("ENTRY: VALID")
+
+    if not ORDERS_ENABLED:
+
+        print()
+        print("PAPER ENTRY DISABLED")
+        print(
+            "Signal is valid, but no order "
+            "was submitted."
+        )
+        print("========================================")
+
+        return
+
+    # Orders intentionally disabled in this version.
+    # We are first verifying the 5-minute
+    # signals against TradingView.
+
+
+# ============================================
+# LIVE STREAM
+# ============================================
+
+stream = StockDataStream(
+    API_KEY,
+    API_SECRET,
+    feed=DataFeed.IEX
+)
+
+
+one_minute_bars = {
+    ticker: []
+    for ticker in TICKERS
+}
 
 
 # ============================================
@@ -976,7 +525,7 @@ async def handle_bar(bar):
 
     ticker = bar.symbol
 
-    if ticker not in one_minute_history:
+    if ticker not in one_minute_bars:
         return
 
     timestamp = pd.Timestamp(
@@ -984,7 +533,6 @@ async def handle_bar(bar):
     )
 
     if timestamp.tzinfo is None:
-
         timestamp = timestamp.tz_localize(
             "UTC"
         )
@@ -1003,28 +551,147 @@ async def handle_bar(bar):
         "volume": float(bar.volume),
     }
 
-    one_minute_history[
-        ticker
-    ].append(record)
+    one_minute_bars[ticker].append(
+        record
+    )
 
-    # Keep enough history for EMA9/VWAP.
-    one_minute_history[
+    # Keep recent 1-minute bars.
+    one_minute_bars[ticker] = (
+        one_minute_bars[ticker][-5:]
+    )
+
+    # ========================================
+    # ONLY PROCESS COMPLETED 5-MINUTE BAR
+    # ========================================
+
+    if timestamp.minute % 5 != 4:
+        return
+
+    bars = one_minute_bars[ticker]
+
+    if len(bars) < 5:
+        return
+
+    df = pd.DataFrame(bars)
+
+    bucket = timestamp.floor(
+        "5min"
+    )
+
+    if not all(
+        pd.Timestamp(x).floor("5min")
+        == bucket
+        for x in df["time"]
+    ):
+        return
+
+    candle = {
+        "ticker": ticker,
+        "time": bucket,
+        "open": float(
+            df.iloc[0]["open"]
+        ),
+        "high": float(
+            df["high"].max()
+        ),
+        "low": float(
+            df["low"].min()
+        ),
+        "close": float(
+            df.iloc[-1]["close"]
+        ),
+        "volume": float(
+            df["volume"].sum()
+        ),
+    }
+
+    # ========================================
+    # CHECK WHETHER THIS IS THE NEXT CANDLE
+    # FOR A PREVIOUS SIGNAL
+    # ========================================
+
+    process_pending_entry(
+        ticker,
+        candle
+    )
+
+    # ========================================
+    # ADD COMPLETED 5-MIN CANDLE
+    # ========================================
+
+    five_minute_history[
         ticker
-    ] = one_minute_history[
+    ].append(candle)
+
+    five_minute_history[
+        ticker
+    ] = five_minute_history[
         ticker
     ][-1000:]
 
     strategy_df = pd.DataFrame(
-        one_minute_history[
-            ticker
+        five_minute_history[ticker]
+    )
+
+    if len(strategy_df) < 3:
+        return
+
+    # ========================================
+    # EMA9
+    # ========================================
+
+    strategy_df["ema9"] = (
+        strategy_df["open"]
+        .ewm(
+            span=EMA_LENGTH,
+            adjust=False
+        )
+        .mean()
+    )
+
+    # ========================================
+    # SESSION VWAP
+    # ========================================
+
+    strategy_df["date"] = (
+        strategy_df["time"].dt.date
+    )
+
+    strategy_df["open_volume"] = (
+        strategy_df["open"]
+        * strategy_df["volume"]
+    )
+
+    strategy_df[
+        "cumulative_open_volume"
+    ] = (
+        strategy_df
+        .groupby("date")["open_volume"]
+        .cumsum()
+    )
+
+    strategy_df[
+        "cumulative_volume"
+    ] = (
+        strategy_df
+        .groupby("date")["volume"]
+        .cumsum()
+    )
+
+    strategy_df["vwap"] = (
+        strategy_df[
+            "cumulative_open_volume"
+        ]
+        / strategy_df[
+            "cumulative_volume"
         ]
     )
 
-    strategy_df = calculate_indicators(
-        strategy_df
-    )
+    # ========================================
+    # CHECK NEW VWAP SIGNAL
+    # ========================================
 
-    process_completed_candle(
+    check_signal(
         ticker,
         strategy_df
     )
@@ -1037,68 +704,33 @@ async def handle_bar(bar):
 async def main():
 
     # ----------------------------------------
-    # 1. Load history
+    # 1. Load today's history
     # ----------------------------------------
 
     raw_data = load_today_history()
 
     # ----------------------------------------
-    # 2. Calculate indicators PER TICKER
-    #
-    # Avoid pandas groupby.apply entirely.
+    # 2. Convert to 5-minute candles
     # ----------------------------------------
 
-    strategy_data_parts = []
-
-    for ticker in TICKERS:
-
-        ticker_data = raw_data[
-            raw_data["ticker"] == ticker
-        ].copy()
-
-        if ticker_data.empty:
-            continue
-
-        ticker_data = calculate_indicators(
-            ticker_data
-        )
-
-        strategy_data_parts.append(
-            ticker_data
-        )
-
-    if not strategy_data_parts:
-
-        raise RuntimeError(
-            "No strategy data was created."
-        )
-
-    strategy_data = pd.concat(
-        strategy_data_parts,
-        ignore_index=True
+    five_df = prepare_strategy_data(
+        raw_data
     )
-
-    strategy_data = strategy_data.sort_values(
-        ["ticker", "time"]
-    ).reset_index(drop=True)
 
     print()
+    print("5-minute strategy data ready.")
     print(
-        "1-minute strategy data ready."
-    )
-
-    print(
-        f"Rows: {len(strategy_data):,}"
+        f"Rows: {len(five_df):,}"
     )
 
     # ----------------------------------------
-    # 3. Seed history
+    # 3. Seed live history
     # ----------------------------------------
 
     for ticker in TICKERS:
 
-        ticker_df = strategy_data[
-            strategy_data["ticker"] == ticker
+        ticker_df = five_df[
+            five_df["ticker"] == ticker
         ].copy()
 
         if ticker_df.empty:
@@ -1106,48 +738,48 @@ async def main():
 
         for _, row in ticker_df.iterrows():
 
-            one_minute_history[
+            five_minute_history[
                 ticker
             ].append(
                 {
                     "ticker": ticker,
                     "time": row["time"],
-                    "open": float(row["open"]),
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"]),
-                    "volume": float(row["volume"]),
+                    "open": float(
+                        row["open"]
+                    ),
+                    "high": float(
+                        row["high"]
+                    ),
+                    "low": float(
+                        row["low"]
+                    ),
+                    "close": float(
+                        row["close"]
+                    ),
+                    "volume": float(
+                        row["volume"]
+                    ),
                 }
             )
 
     print()
-    print(
-        "1-minute history seeded."
-    )
+    print("Strategy history seeded.")
 
     for ticker in TICKERS:
 
         print(
             f"{ticker:5s}: "
-            f"{len(one_minute_history[ticker])} "
-            f"1-minute candles"
+            f"{len(five_minute_history[ticker])} "
+            f"5-minute candles"
         )
 
     # ----------------------------------------
-    # 4. LIVE IEX STREAM
+    # 4. Start live stream
     # ----------------------------------------
-
-    stream = StockDataStream(
-        API_KEY,
-        API_SECRET,
-        feed=DataFeed.IEX
-    )
 
     print()
     print("========================================")
-    print(
-        "STARTING LIVE IEX 1-MINUTE STREAM"
-    )
+    print("STARTING LIVE 5-MINUTE IEX STREAM")
     print("========================================")
 
     for ticker in TICKERS:
@@ -1165,5 +797,4 @@ async def main():
 # ============================================
 
 if __name__ == "__main__":
-
     asyncio.run(main())
