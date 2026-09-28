@@ -7,8 +7,14 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest
 from alpaca.trading.enums import AssetStatus, ContractType
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
+from alpaca.data.historical import (
+    StockHistoricalDataClient,
+    OptionHistoricalDataClient,
+)
+from alpaca.data.requests import (
+    StockLatestTradeRequest,
+    OptionLatestQuoteRequest,
+)
 
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -18,12 +24,8 @@ def main():
 
     print("========================================")
     print("OPTIONS TRADING BOT")
-    print("STEP 8 - OPTION CONTRACT TEST")
+    print("STEP 9 - LIVE OPTION QUOTE TEST")
     print("========================================")
-
-    # ----------------------------------------
-    # Credentials
-    # ----------------------------------------
 
     api_key = os.environ.get("APCA_API_KEY_ID")
     api_secret = os.environ.get("APCA_API_SECRET_KEY")
@@ -43,7 +45,7 @@ def main():
     print("Paper trading: ENABLED")
 
     # ----------------------------------------
-    # Trading client
+    # Clients
     # ----------------------------------------
 
     trading_client = TradingClient(
@@ -51,6 +53,20 @@ def main():
         api_secret,
         paper=True
     )
+
+    stock_client = StockHistoricalDataClient(
+        api_key,
+        api_secret
+    )
+
+    option_client = OptionHistoricalDataClient(
+        api_key,
+        api_secret
+    )
+
+    # ----------------------------------------
+    # Account
+    # ----------------------------------------
 
     account = trading_client.get_account()
 
@@ -62,45 +78,28 @@ def main():
     print(f"Buying power: ${float(account.buying_power):,.2f}")
 
     # ----------------------------------------
-    # Get current TSLA price
+    # Get live TSLA price
     # ----------------------------------------
 
-    data_client = StockHistoricalDataClient(
-        api_key,
-        api_secret
-    )
-
-    latest_request = StockLatestTradeRequest(
+    stock_request = StockLatestTradeRequest(
         symbol_or_symbols=["TSLA"]
     )
 
-    latest_trades = data_client.get_stock_latest_trade(
-        latest_request
+    stock_trades = stock_client.get_stock_latest_trade(
+        stock_request
     )
 
-    tsla_trade = latest_trades["TSLA"]
-    tsla_price = float(tsla_trade.price)
+    tsla_price = float(stock_trades["TSLA"].price)
 
     print("\nTSLA")
     print("----------------------------------------")
-    print(f"Current price: ${tsla_price:.2f}")
-    print(f"Trade time:    {tsla_trade.timestamp}")
+    print(f"Underlying price: ${tsla_price:.2f}")
 
     # ----------------------------------------
-    # Current New York date
+    # Get today's nearest contracts
     # ----------------------------------------
 
-    now_ny = datetime.now(NY_TZ)
-    today = now_ny.date()
-
-    print(f"NY date:       {today}")
-
-    # ----------------------------------------
-    # Get TSLA CALL contracts
-    # ----------------------------------------
-
-    print("\nFETCHING TSLA CALLS")
-    print("----------------------------------------")
+    today = datetime.now(NY_TZ).date()
 
     call_request = GetOptionContractsRequest(
         underlying_symbols=["TSLA"],
@@ -110,23 +109,6 @@ def main():
         limit=10000
     )
 
-    call_response = trading_client.get_option_contracts(
-        call_request
-    )
-
-    calls = [
-        contract
-        for contract in call_response.option_contracts
-        if contract.tradable
-    ]
-
-    # ----------------------------------------
-    # Get TSLA PUT contracts
-    # ----------------------------------------
-
-    print("FETCHING TSLA PUTS")
-    print("----------------------------------------")
-
     put_request = GetOptionContractsRequest(
         underlying_symbols=["TSLA"],
         status=AssetStatus.ACTIVE,
@@ -135,87 +117,135 @@ def main():
         limit=10000
     )
 
-    put_response = trading_client.get_option_contracts(
+    calls = trading_client.get_option_contracts(
+        call_request
+    ).option_contracts
+
+    puts = trading_client.get_option_contracts(
         put_request
-    )
+    ).option_contracts
+
+    calls = [
+        c for c in calls
+        if c.tradable
+    ]
 
     puts = [
-        contract
-        for contract in put_response.option_contracts
-        if contract.tradable
+        p for p in puts
+        if p.tradable
     ]
 
     # ----------------------------------------
-    # Sort contracts
+    # Select nearest strike
     # ----------------------------------------
 
-    calls.sort(
-        key=lambda x: (
-            x.expiration_date,
-            abs(float(x.strike_price) - tsla_price)
+    nearest_call = min(
+        calls,
+        key=lambda c: (
+            c.expiration_date,
+            abs(float(c.strike_price) - tsla_price)
         )
     )
 
-    puts.sort(
-        key=lambda x: (
-            x.expiration_date,
-            abs(float(x.strike_price) - tsla_price)
+    nearest_put = min(
+        puts,
+        key=lambda p: (
+            p.expiration_date,
+            abs(float(p.strike_price) - tsla_price)
         )
     )
 
+    call_symbol = nearest_call.symbol
+    put_symbol = nearest_put.symbol
+
+    print("\nSELECTED CONTRACTS")
+    print("----------------------------------------")
+    print(
+        f"CALL: {call_symbol} | "
+        f"Strike=${float(nearest_call.strike_price):.2f} | "
+        f"Expiry={nearest_call.expiration_date}"
+    )
+
+    print(
+        f"PUT:  {put_symbol} | "
+        f"Strike=${float(nearest_put.strike_price):.2f} | "
+        f"Expiry={nearest_put.expiration_date}"
+    )
+
     # ----------------------------------------
-    # Display nearest CALLS
+    # Get live option quotes
     # ----------------------------------------
 
-    print("\nNEAREST TSLA CALLS")
+    print("\nLIVE OPTION QUOTES")
     print("----------------------------------------")
 
-    for contract in calls[:10]:
-        print(
-            f"{contract.symbol} | "
-            f"Strike=${float(contract.strike_price):.2f} | "
-            f"Expiry={contract.expiration_date} | "
-            f"Tradable={contract.tradable}"
-        )
+    quote_request = OptionLatestQuoteRequest(
+        symbol_or_symbols=[
+            call_symbol,
+            put_symbol
+        ]
+    )
+
+    quotes = option_client.get_option_latest_quote(
+        quote_request
+    )
 
     # ----------------------------------------
-    # Display nearest PUTS
+    # Display CALL quote
     # ----------------------------------------
 
-    print("\nNEAREST TSLA PUTS")
+    call_quote = quotes[call_symbol]
+
+    print("\nCALL")
     print("----------------------------------------")
-
-    for contract in puts[:10]:
-        print(
-            f"{contract.symbol} | "
-            f"Strike=${float(contract.strike_price):.2f} | "
-            f"Expiry={contract.expiration_date} | "
-            f"Tradable={contract.tradable}"
-        )
+    print(f"Symbol:       {call_symbol}")
+    print(f"Bid:          ${float(call_quote.bid_price):.2f}")
+    print(f"Ask:          ${float(call_quote.ask_price):.2f}")
+    print(f"Bid size:     {call_quote.bid_size}")
+    print(f"Ask size:     {call_quote.ask_size}")
+    print(f"Timestamp:    {call_quote.timestamp}")
 
     # ----------------------------------------
-    # Summary
+    # Display PUT quote
+    # ----------------------------------------
+
+    put_quote = quotes[put_symbol]
+
+    print("\nPUT")
+    print("----------------------------------------")
+    print(f"Symbol:       {put_symbol}")
+    print(f"Bid:          ${float(put_quote.bid_price):.2f}")
+    print(f"Ask:          ${float(put_quote.ask_price):.2f}")
+    print(f"Bid size:     {put_quote.bid_size}")
+    print(f"Ask size:     {put_quote.ask_size}")
+    print(f"Timestamp:    {put_quote.timestamp}")
+
+    # ----------------------------------------
+    # Calculate 25-contract notional
+    # ----------------------------------------
+
+    call_ask = float(call_quote.ask_price)
+    put_ask = float(put_quote.ask_price)
+
+    call_cost = call_ask * 100 * 25
+    put_cost = put_ask * 100 * 25
+
+    print("\n25-CONTRACT COST")
+    print("----------------------------------------")
+    print(f"CALL ask cost: ${call_cost:,.2f}")
+    print(f"PUT ask cost:  ${put_cost:,.2f}")
+
+    # ----------------------------------------
+    # Safety confirmation
     # ----------------------------------------
 
     print("\n========================================")
-    print("STEP 8 COMPLETE")
+    print("STEP 9 COMPLETE")
     print("========================================")
-    print(f"TSLA price:        ${tsla_price:.2f}")
-    print(f"Tradable calls:    {len(calls)}")
-    print(f"Tradable puts:     {len(puts)}")
-
-    if calls:
-        print(
-            f"Nearest call:     {calls[0].symbol}"
-        )
-
-    if puts:
-        print(
-            f"Nearest put:      {puts[0].symbol}"
-        )
-
-    print("----------------------------------------")
-    print("ORDER SUBMISSION: DISABLED")
+    print("Underlying data:       OK")
+    print("Option contracts:      OK")
+    print("Live option quotes:    OK")
+    print("Order submission:      DISABLED")
     print("NO ORDERS WERE PLACED")
     print("========================================")
 
