@@ -55,10 +55,10 @@ PAPER_MODE = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
 
 print("========================================")
 print("OPTIONS TRADING BOT")
-print("STEP 11 - HISTORY + LIVE ENGINE")
+print("STEP 12 - 1-MINUTE LIVE TEST")
 print("========================================")
 print(f"Paper mode: {'ENABLED' if PAPER_MODE else 'DISABLED'}")
-print("Timeframe:   5 minutes")
+print("Timeframe:   1 minute")
 print("Start time:  10:00 NY")
 print("Data feed:   IEX")
 print(f"Contracts:   {CONTRACTS}")
@@ -91,8 +91,6 @@ def load_today_history():
         microsecond=0
     )
 
-    # Only request completed data.
-    # Leave the currently-forming minute out.
     end_time = now_ny - timedelta(minutes=1)
 
     print()
@@ -116,11 +114,13 @@ def load_today_history():
     if df.empty:
         raise RuntimeError("No historical bars were returned.")
 
-    # Alpaca returns symbol as a column when multiple tickers are requested.
     if "symbol" in df.columns:
         df = df.rename(columns={"symbol": "ticker"})
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True
+    )
 
     df["timestamp"] = df["timestamp"].dt.tz_convert(
         "America/New_York"
@@ -166,7 +166,7 @@ def load_today_history():
 
 
 # ============================================
-# BUILD 5-MINUTE STRATEGY DATA
+# BUILD 1-MINUTE STRATEGY DATA
 # ============================================
 
 def prepare_strategy_data(raw_data):
@@ -186,27 +186,21 @@ def prepare_strategy_data(raw_data):
 
         ticker_df = ticker_df.set_index("time")
 
-        five = ticker_df.resample(
-            "5min",
-            origin="start_day"
-        ).agg(
-            {
-                "ticker": "first",
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
+        # Data is already 1-minute.
+        one = ticker_df.copy()
+
+        one = one.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close"
+            ]
         )
 
-        five = five.dropna(
-            subset=["open", "high", "low", "close"]
-        )
-
-        # EMA9 using OPEN, exactly as the strategy specifies.
-        five["ema9"] = (
-            five["open"]
+        # EMA9 using OPEN.
+        one["ema9"] = (
+            one["open"]
             .ewm(
                 span=EMA_LENGTH,
                 adjust=False
@@ -215,34 +209,34 @@ def prepare_strategy_data(raw_data):
         )
 
         # Session VWAP using OPEN.
-        five["date"] = five.index.date
+        one["date"] = one.index.date
 
-        five["open_volume"] = (
-            five["open"] * five["volume"]
+        one["open_volume"] = (
+            one["open"] * one["volume"]
         )
 
-        five["cumulative_open_volume"] = (
-            five.groupby("date")["open_volume"]
+        one["cumulative_open_volume"] = (
+            one.groupby("date")["open_volume"]
             .cumsum()
         )
 
-        five["cumulative_volume"] = (
-            five.groupby("date")["volume"]
+        one["cumulative_volume"] = (
+            one.groupby("date")["volume"]
             .cumsum()
         )
 
-        five["vwap"] = (
-            five["cumulative_open_volume"]
-            / five["cumulative_volume"]
+        one["vwap"] = (
+            one["cumulative_open_volume"]
+            / one["cumulative_volume"]
         )
 
-        five = five.reset_index()
+        one = one.reset_index()
 
-        results.append(five)
+        results.append(one)
 
     if not results:
         raise RuntimeError(
-            "No 5-minute strategy data could be created."
+            "No 1-minute strategy data could be created."
         )
 
     result = pd.concat(
@@ -263,7 +257,7 @@ def prepare_strategy_data(raw_data):
 
 def check_completed_candle(ticker, df):
 
-    if len(df) < 3:
+    if len(df) < 2:
         return
 
     previous = df.iloc[-2]
@@ -271,13 +265,17 @@ def check_completed_candle(ticker, df):
 
     signal_time = signal["time"]
 
-    # Ignore anything before 10:00.
+    # Ignore signals before 10:00.
     if signal_time.time() < START_TIME:
         return
 
     # Must be same trading day.
     if previous["time"].date() != signal_time.date():
         return
+
+    # ----------------------------------------
+    # VWAP CROSS
+    # ----------------------------------------
 
     long_signal = (
         previous["close"] <= previous["vwap"]
@@ -308,13 +306,25 @@ def check_completed_candle(ticker, df):
 
         print("Direction:    LONG")
 
+        print(
+            "Entry filter: "
+            "NEXT candle OPEN must be ABOVE "
+            "signal EMA9."
+        )
+
     else:
 
         direction = "SHORT"
 
         print("Direction:    SHORT")
 
-    print("Waiting for NEXT 5-minute candle.")
+        print(
+            "Entry filter: "
+            "NEXT candle OPEN must be BELOW "
+            "signal EMA9."
+        )
+
+    print("Waiting for NEXT 1-minute candle.")
     print("========================================")
 
 
@@ -329,13 +339,7 @@ stream = StockDataStream(
 )
 
 
-one_minute_bars = {
-    ticker: []
-    for ticker in TICKERS
-}
-
-
-five_minute_history = {
+one_minute_history = {
     ticker: []
     for ticker in TICKERS
 }
@@ -349,7 +353,7 @@ async def handle_bar(bar):
 
     ticker = bar.symbol
 
-    if ticker not in one_minute_bars:
+    if ticker not in one_minute_history:
         return
 
     timestamp = pd.Timestamp(bar.timestamp)
@@ -371,59 +375,27 @@ async def handle_bar(bar):
         "volume": float(bar.volume),
     }
 
-    one_minute_bars[ticker].append(record)
-
-    # Keep only recent live 1-minute bars.
-    one_minute_bars[ticker] = (
-        one_minute_bars[ticker][-5:]
+    # Store completed 1-minute candle.
+    one_minute_history[ticker].append(
+        record
     )
 
-    # Only process completed 5-minute candles.
-    #
-    # Example:
-    # 10:00, 10:01, 10:02, 10:03, 10:04
-    # creates the completed 10:00 5-minute candle.
-    if timestamp.minute % 5 != 4:
-        return
-
-    bars = one_minute_bars[ticker]
-
-    if len(bars) < 5:
-        return
-
-    df = pd.DataFrame(bars)
-
-    # Make sure all five bars belong to the same 5-minute bucket.
-    bucket = timestamp.floor("5min")
-
-    if not all(
-        pd.Timestamp(x).floor("5min") == bucket
-        for x in df["time"]
-    ):
-        return
-
-    candle = {
-        "ticker": ticker,
-        "time": bucket,
-        "open": df.iloc[0]["open"],
-        "high": df["high"].max(),
-        "low": df["low"].min(),
-        "close": df.iloc[-1]["close"],
-        "volume": df["volume"].sum(),
-    }
-
-    five_minute_history[ticker].append(candle)
-
-    # Keep enough candles for EMA/VWAP calculations.
-    five_minute_history[ticker] = (
-        five_minute_history[ticker][-1000:]
+    # Keep enough history for EMA9 + VWAP.
+    one_minute_history[ticker] = (
+        one_minute_history[ticker][-1000:]
     )
 
     strategy_df = pd.DataFrame(
-        five_minute_history[ticker]
+        one_minute_history[ticker]
     )
 
-    # Recalculate indicators.
+    if len(strategy_df) < 2:
+        return
+
+    # ----------------------------------------
+    # EMA9
+    # ----------------------------------------
+
     strategy_df["ema9"] = (
         strategy_df["open"]
         .ewm(
@@ -432,6 +404,10 @@ async def handle_bar(bar):
         )
         .mean()
     )
+
+    # ----------------------------------------
+    # SESSION VWAP
+    # ----------------------------------------
 
     strategy_df["date"] = (
         strategy_df["time"].dt.date
@@ -459,6 +435,10 @@ async def handle_bar(bar):
         / strategy_df["cumulative_volume"]
     )
 
+    # ----------------------------------------
+    # CHECK 1-MINUTE CANDLE
+    # ----------------------------------------
+
     check_completed_candle(
         ticker,
         strategy_df
@@ -472,31 +452,31 @@ async def handle_bar(bar):
 async def main():
 
     # ----------------------------------------
-    # 1. Load today's completed history
+    # 1. Load today's 1-minute history
     # ----------------------------------------
 
     raw_data = load_today_history()
 
     # ----------------------------------------
-    # 2. Build 5-minute candles
+    # 2. Build 1-minute strategy data
     # ----------------------------------------
 
-    five_df = prepare_strategy_data(
+    strategy_df = prepare_strategy_data(
         raw_data
     )
 
     print()
-    print("5-minute strategy data ready.")
-    print(f"Rows: {len(five_df):,}")
+    print("1-minute strategy data ready.")
+    print(f"Rows: {len(strategy_df):,}")
 
     # ----------------------------------------
-    # 3. Seed live strategy history
+    # 3. Seed live history
     # ----------------------------------------
 
     for ticker in TICKERS:
 
-        ticker_df = five_df[
-            five_df["ticker"] == ticker
+        ticker_df = strategy_df[
+            strategy_df["ticker"] == ticker
         ].copy()
 
         if ticker_df.empty:
@@ -504,7 +484,7 @@ async def main():
 
         for _, row in ticker_df.iterrows():
 
-            five_minute_history[ticker].append(
+            one_minute_history[ticker].append(
                 {
                     "ticker": ticker,
                     "time": row["time"],
@@ -517,22 +497,22 @@ async def main():
             )
 
     print()
-    print("Strategy history seeded.")
+    print("1-minute history seeded.")
 
     for ticker in TICKERS:
         print(
             f"{ticker:5s}: "
-            f"{len(five_minute_history[ticker])} "
-            f"5-minute candles"
+            f"{len(one_minute_history[ticker])} "
+            f"1-minute candles"
         )
 
     # ----------------------------------------
-    # 4. Subscribe to live IEX bars
+    # 4. Start live stream
     # ----------------------------------------
 
     print()
     print("========================================")
-    print("STARTING LIVE IEX STREAM")
+    print("STARTING LIVE IEX 1-MINUTE STREAM")
     print("========================================")
 
     for ticker in TICKERS:
