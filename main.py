@@ -17,7 +17,7 @@ TICKERS = [
 
 
 def main():
-
+    
     print("========================================")
     print("OPTIONS TRADING BOT")
     print("STEP 7 - BROKER + MARKET DATA TEST")
