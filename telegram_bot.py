@@ -86,6 +86,8 @@ def build_help():
 
 /summary — Full daily overview
 
+/overall — Weekly, monthly & yearly performance
+
 /now — What the bot is currently watching and what conditions are still needed for entry
 
 /help — Show this command list"""
@@ -324,6 +326,50 @@ def _summary_message(state):
     )
 
 
+
+def _overall_message(state):
+    trades = state.get("all_trades", [])
+    now = datetime.now(TIMEZONE)
+    periods = [
+        ("TODAY", now.date()),
+        ("THIS WEEK", now.date() - __import__("datetime").timedelta(days=now.weekday())),
+        ("THIS MONTH", now.replace(day=1).date()),
+        ("THIS YEAR", now.replace(month=1, day=1).date()),
+    ]
+
+    lines = ["📊 OVERALL PERFORMANCE", ""]
+
+    for label, start_date in periods:
+        period_trades = [
+            t for t in trades
+            if t["entry_time"].date() >= start_date
+            and t["status"] == "CLOSED"
+        ]
+
+        wins = sum(1 for t in period_trades if (t.get("return_pct") or 0) > 0)
+        losses = sum(1 for t in period_trades if (t.get("return_pct") or 0) < 0)
+        breakeven = sum(1 for t in period_trades if (t.get("return_pct") or 0) == 0)
+        total = len(period_trades)
+        win_rate = (wins / total * 100) if total else 0.0
+        pnl = sum(t.get("return_pct", 0.0) or 0.0 for t in period_trades)
+
+        lines.extend([
+            label,
+            f"Trades: {total}",
+            f"Wins: {wins}",
+            f"Losses: {losses}",
+            f"Breakeven: {breakeven}",
+            f"Win rate: {win_rate:.2f}%",
+            f"P&L: {_signed_pct(pnl)}",
+            "",
+        ])
+
+    lines.append(
+        "Note: P&L shown here is strategy return, because option orders are currently disabled."
+    )
+    return "\n".join(lines)
+
+
 def _now_message(state):
     lines = ["👀 NOW WATCHING", ""]
 
@@ -403,6 +449,9 @@ async def handle_command(command, state):
     if command == "/summary":
         return _summary_message(state)
 
+    if command == "/overall":
+        return _overall_message(state)
+
     if command == "/now":
         return _now_message(state)
 
@@ -436,12 +485,12 @@ async def telegram_poll_loop(state):
                 if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
                     continue
 
-                text = (message.get("text") or "").strip().split()[0].lower()
+                text = (message.get("text") or "").strip().lower()
 
                 if not text.startswith("/"):
                     continue
 
-                command = text.split("@")[0]
+                command = text.split()[0].split("@")[0]
 
                 response = await handle_command(command, state)
                 await send_message(response, chat_id=chat_id)
