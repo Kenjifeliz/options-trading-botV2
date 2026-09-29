@@ -1,500 +1,1134 @@
 import os
 import asyncio
-import json
-import urllib.request
-import urllib.parse
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+import requests
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
 
 TIMEZONE = ZoneInfo("America/New_York")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TICKERS = [
+    "AAPL",
+    "AMD",
+    "ASTS",
+    "BE",
+    "GOOG",
+    "HIMS",
+    "INTC",
+    "IREN",
+    "JPM",
+    "MRVL",
+    "NBIS",
+    "NVDA",
+    "ORCL",
+    "PLTR",
+    "QQQ",
+    "RKLB",
+    "SPCX",
+    "SPY",
+    "TSLA",
+]
+
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN"
+)
+
+TELEGRAM_CHAT_ID = os.environ.get(
+    "TELEGRAM_CHAT_ID"
+)
+
+PAPER_MODE = (
+    os.environ.get(
+        "ALPACA_PAPER",
+        "true"
+    ).lower()
+    == "true"
+)
 
 
-def _post_telegram(method, params):
+# ============================================================
+# TELEGRAM API
+# ============================================================
+
+BASE_URL = (
+    f"https://api.telegram.org/bot"
+    f"{TELEGRAM_BOT_TOKEN}"
+)
+
+
+def _post_telegram(
+    method,
+    payload=None,
+):
+
     if not TELEGRAM_BOT_TOKEN:
         return None
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    data = urllib.parse.urlencode(params).encode("utf-8")
-
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
+    url = (
+        f"{BASE_URL}/{method}"
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-async def send_message(message, chat_id=None):
-    target = str(chat_id or TELEGRAM_CHAT_ID or "")
-
-    if not TELEGRAM_BOT_TOKEN or not target:
-        return
-
     try:
-        await asyncio.to_thread(
-            _post_telegram,
-            "sendMessage",
-            {
-                "chat_id": target,
-                "text": message,
-            },
+
+        response = requests.post(
+            url,
+            json=payload or {},
+            timeout=20,
         )
+
+        response.raise_for_status()
+
+        return response.json()
+
     except Exception as exc:
-        print(f"Telegram send error: {exc}")
+
+        print(
+            f"Telegram API error: {exc}"
+        )
+
+        return None
 
 
-def _get_updates(offset):
+def send_message(
+    message,
+    chat_id=None,
+):
+
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+
+    target_chat = (
+        chat_id
+        or TELEGRAM_CHAT_ID
+    )
+
+    if not target_chat:
+        return None
+
     return _post_telegram(
-        "getUpdates",
+        "sendMessage",
         {
-            "offset": offset,
-            "timeout": 20,
-            "allowed_updates": json.dumps(["message"]),
+            "chat_id": target_chat,
+            "text": message,
         },
     )
 
 
-def _money(value):
-    if value is None:
-        return "N/A"
-    return f"${value:,.2f}"
+# ============================================================
+# TELEGRAM UPDATES
+# ============================================================
+
+def _get_updates(
+    offset=None,
+):
+
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+
+    payload = {
+        "timeout": 20,
+    }
+
+    if offset is not None:
+        payload["offset"] = offset
+
+    result = _post_telegram(
+        "getUpdates",
+        payload,
+    )
+
+    if not result:
+        return []
+
+    if not result.get("ok"):
+        return []
+
+    return result.get(
+        "result",
+        [],
+    )
 
 
-def _signed_pct(value):
-    return f"{value:+.2f}%"
-
+# ============================================================
+# HELP
+# ============================================================
 
 def build_help():
-    return """🤖 BOT COMMANDS
 
-/start — Bot status, mode & portfolio size
+    return (
+        "🤖 BOT COMMANDS\n\n"
 
-/status — Full bot connection & operating status
-
-/positions — Current open positions & unrealized P&L
-
-/trades — Today's trades & individual results
-
-/p&l — Today's realized, unrealized & total P&L
-
-/signals — Recent strategy signals & their status
-
-/summary — Full daily overview
-
-/overall — Weekly, monthly & yearly performance
-
-/now — What the bot is currently watching and what conditions are still needed for entry
-
-/help — Show this command list"""
+        "/start — Bot status, mode & portfolio size\n"
+        "/status — Full bot connection & operating status\n"
+        "/positions — Current open positions & unrealized P&L\n"
+        "/trades — Today's trades & individual results\n"
+        "/p&l — Today's realized, unrealized & total P&L\n"
+        "/signals — Recent strategy signals & their status\n"
+        "/summary — Full daily overview\n"
+        "/now — What the bot is currently watching\n"
+        "/overall — Weekly, monthly & yearly performance\n"
+        "/help — Show this command list"
+    )
 
 
-def _latest_price(state, ticker):
-    rows = state["history"].get(ticker, [])
-    if not rows:
+# ============================================================
+# SAFE STATE HELPERS
+# ============================================================
+
+def _state_value(
+    state,
+    key,
+    default=None,
+):
+
+    if not isinstance(
+        state,
+        dict,
+    ):
+        return default
+
+    return state.get(
+        key,
+        default,
+    )
+
+
+def _active_entries(
+    state,
+):
+
+    result = _state_value(
+        state,
+        "active_entries",
+        {},
+    )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return {}
+
+    return result
+
+
+def _all_trades(
+    state,
+):
+
+    result = _state_value(
+        state,
+        "all_trades",
+        [],
+    )
+
+    if not isinstance(
+        result,
+        list,
+    ):
+        return []
+
+    return result
+
+
+def _five_minute_history(
+    state,
+):
+
+    result = _state_value(
+        state,
+        "five_minute_history",
+        {},
+    )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return {}
+
+    return result
+
+
+# ============================================================
+# FORMAT HELPERS
+# ============================================================
+
+def _safe_float(
+    value,
+):
+
+    try:
+        return float(value)
+    except Exception:
         return None
-    return float(rows[-1]["close"])
 
 
-def _position_lines(state):
-    lines = ["📊 OPEN POSITIONS", ""]
-    positions = []
+def _format_money(
+    value,
+):
 
-    for ticker in state["tickers"]:
-        for entry in state["active_entries"].get(ticker, []):
-            current = _latest_price(state, ticker)
-            entry_price = float(entry["entry_price"])
-            direction = entry["direction"]
+    number = _safe_float(
+        value
+    )
 
-            if current is None:
-                pct = None
-            elif direction == "LONG":
-                pct = (current / entry_price - 1) * 100
+    if number is None:
+        return "N/A"
+
+    return (
+        f"${number:+,.2f}"
+    )
+
+
+def _format_pct(
+    value,
+):
+
+    number = _safe_float(
+        value
+    )
+
+    if number is None:
+        return "N/A"
+
+    return (
+        f"{number:+.2f}%"
+    )
+
+
+def _trade_pnl(
+    trade,
+):
+
+    value = trade.get(
+        "pnl"
+    )
+
+    if value is not None:
+        return _safe_float(
+            value
+        )
+
+    entry = _safe_float(
+        trade.get(
+            "entry_option"
+        )
+    )
+
+    exit_price = _safe_float(
+        trade.get(
+            "exit_option"
+        )
+    )
+
+    contracts = _safe_float(
+        trade.get(
+            "contracts",
+            5,
+        )
+    )
+
+    if (
+        entry is None
+        or exit_price is None
+        or contracts is None
+    ):
+        return None
+
+    return (
+        exit_price
+        - entry
+    ) * contracts * 100
+
+
+def _trade_is_closed(
+    trade,
+):
+
+    exit_time = trade.get(
+        "exit_time"
+    )
+
+    status = str(
+        trade.get(
+            "status",
+            ""
+        )
+    ).upper()
+
+    return (
+        exit_time is not None
+        or status == "CLOSED"
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+def _start_message(
+    state,
+):
+
+    mode = (
+        "PAPER"
+        if PAPER_MODE
+        else "LIVE"
+    )
+
+    active = _active_entries(
+        state
+    )
+
+    position_count = sum(
+        len(entries)
+        for entries in active.values()
+        if isinstance(
+            entries,
+            list,
+        )
+    )
+
+    return (
+        "🟢 BOT STATUS: ONLINE\n\n"
+        f"MODE: {mode}\n"
+        f"OPEN POSITIONS: {position_count}\n"
+        "ORDERS: ENABLED"
+    )
+
+
+# ============================================================
+# /STATUS
+# ============================================================
+
+def _status_message(
+    state,
+):
+
+    mode = (
+        "PAPER"
+        if PAPER_MODE
+        else "LIVE"
+    )
+
+    active = _active_entries(
+        state
+    )
+
+    position_count = sum(
+        len(entries)
+        for entries in active.values()
+        if isinstance(
+            entries,
+            list,
+        )
+    )
+
+    trades = _all_trades(
+        state
+    )
+
+    today = datetime.now(
+        TIMEZONE
+    ).date()
+
+    today_trades = []
+
+    for trade in trades:
+
+        value = (
+            trade.get(
+                "entry_time"
+            )
+            or trade.get(
+                "signal_time"
+            )
+        )
+
+        if not value:
+            continue
+
+        try:
+
+            trade_date = (
+                datetime.fromisoformat(
+                    str(value)
+                    .replace(
+                        "Z",
+                        "+00:00",
+                    )
+                )
+                .astimezone(
+                    TIMEZONE
+                )
+                .date()
+            )
+
+        except Exception:
+            continue
+
+        if trade_date == today:
+            today_trades.append(
+                trade
+            )
+
+    return (
+        "🟢 BOT STATUS: ONLINE\n\n"
+        f"Mode: {mode}\n"
+        "Market data: CONNECTED\n"
+        "Alpaca: CONNECTED\n"
+        "Telegram: CONNECTED\n"
+        f"Active positions: {position_count}\n"
+        f"Trades today: {len(today_trades)}"
+    )
+
+
+# ============================================================
+# /POSITIONS
+# ============================================================
+
+def _position_lines(
+    state,
+):
+
+    active = _active_entries(
+        state
+    )
+
+    lines = []
+
+    total_positions = 0
+
+    for ticker in TICKERS:
+
+        entries = active.get(
+            ticker,
+            [],
+        )
+
+        if not isinstance(
+            entries,
+            list,
+        ):
+            continue
+
+        for entry in entries:
+
+            total_positions += 1
+
+            entry_price = _safe_float(
+                entry.get(
+                    "entry_option"
+                )
+            )
+
+            option_symbol = (
+                entry.get(
+                    "option_symbol",
+                    "N/A",
+                )
+            )
+
+            contracts = entry.get(
+                "contracts",
+                5,
+            )
+
+            entry_text = (
+                f"${entry_price:.2f}"
+                if entry_price is not None
+                else "N/A"
+            )
+
+            lines.append(
+                f"{ticker} — LONG CALL\n"
+                f"Option: {option_symbol}\n"
+                f"Entry: {entry_text}\n"
+                f"Contracts: {contracts}"
+            )
+
+    if not lines:
+
+        return (
+            "📊 OPEN POSITIONS\n\n"
+            "No open positions."
+        )
+
+    return (
+        "📊 OPEN POSITIONS\n\n"
+        + "\n\n".join(
+            lines
+        )
+        + "\n\n"
+        f"Total: {total_positions} positions"
+    )
+
+
+# ============================================================
+# /TRADES
+# ============================================================
+
+def _trades_message(
+    state,
+):
+
+    trades = _all_trades(
+        state
+    )
+
+    today = datetime.now(
+        TIMEZONE
+    ).date()
+
+    today_trades = []
+
+    for trade in trades:
+
+        value = (
+            trade.get(
+                "entry_time"
+            )
+            or trade.get(
+                "signal_time"
+            )
+        )
+
+        if not value:
+            continue
+
+        try:
+
+            trade_date = (
+                datetime.fromisoformat(
+                    str(value)
+                    .replace(
+                        "Z",
+                        "+00:00",
+                    )
+                )
+                .astimezone(
+                    TIMEZONE
+                )
+                .date()
+            )
+
+        except Exception:
+            continue
+
+        if trade_date == today:
+
+            today_trades.append(
+                trade
+            )
+
+    if not today_trades:
+
+        return (
+            "📈 TODAY'S TRADES\n\n"
+            "No trades today."
+        )
+
+    lines = [
+        "📈 TODAY'S TRADES",
+        "",
+        f"{len(today_trades)} trades",
+    ]
+
+    realized = 0.0
+    wins = 0
+    losses = 0
+    open_count = 0
+
+    for index, trade in enumerate(
+        today_trades,
+        start=1,
+    ):
+
+        pnl = _trade_pnl(
+            trade
+        )
+
+        ticker = trade.get(
+            "ticker",
+            "N/A",
+        )
+
+        if _trade_is_closed(
+            trade
+        ):
+
+            if pnl is not None:
+
+                realized += pnl
+
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+
+                result_text = (
+                    _format_money(
+                        pnl
+                    )
+                )
+
             else:
-                pct = (entry_price / current - 1) * 100
 
-            held = max(
-                0,
-                int(
-                    (
-                        state["last_market_update"] - entry["entry_time"]
-                    ).total_seconds() // 60
-                ),
-            ) if state["last_market_update"] else 0
+                result_text = "P&L N/A"
 
-            positions.append((ticker, direction, entry_price, current, pct, held))
+        else:
 
-    if not positions:
-        lines.append("No open strategy positions.")
-        return "\n".join(lines)
-
-    total_pct = 0.0
-
-    for ticker, direction, entry_price, current, pct, held in positions:
-        lines.append(
-            f"{ticker} — {direction}\n"
-            f"Entry: {_money(entry_price)}\n"
-            f"Current: {_money(current)}\n"
-            f"P&L: {_signed_pct(pct) if pct is not None else 'N/A'}\n"
-            f"Hold: {held} min\n"
-        )
-        if pct is not None:
-            total_pct += pct
-
-    lines.append(f"Total: {len(positions)} positions")
-    lines.append(f"Strategy unrealized P&L: {_signed_pct(total_pct)}")
-    lines.append("")
-    lines.append("Note: option orders are currently disabled, so this is underlying-strategy P&L.")
-
-    return "\n".join(lines)
-
-
-def _trades_message(state):
-    trades = state["trades_today"]
-
-    lines = ["📈 TODAY'S TRADES", ""]
-    lines.append(f"{len(trades)} trades")
-    lines.append("")
-
-    if not trades:
-        lines.append("No completed or entered trades today.")
-        return "\n".join(lines)
-
-    for i, trade in enumerate(trades[-20:], 1):
-        direction = trade["direction"]
-        status = trade["status"]
-        pct = trade.get("return_pct")
-
-        result = (
-            _signed_pct(pct)
-            if pct is not None
-            else "OPEN"
-        )
+            open_count += 1
+            result_text = "OPEN"
 
         lines.append(
-            f"{i}. {trade['ticker']} — {direction} — {result} — {status}"
+            f"{index}. {ticker} — "
+            f"LONG CALL — "
+            f"{result_text}"
         )
-
-    completed = [t for t in trades if t["status"] == "CLOSED"]
-    wins = sum(1 for t in completed if (t.get("return_pct") or 0) > 0)
-    losses = sum(1 for t in completed if (t.get("return_pct") or 0) < 0)
-    open_count = sum(1 for t in trades if t["status"] == "OPEN")
-
-    realized = sum(t.get("return_pct", 0.0) or 0.0 for t in completed)
 
     lines.extend(
         [
             "",
-            f"Realized strategy return: {_signed_pct(realized)}",
+            f"Realized P&L: "
+            f"{_format_money(realized)}",
             f"Wins: {wins}",
             f"Losses: {losses}",
             f"Open: {open_count}",
-            "",
-            "Note: option orders are currently disabled, so dollar option P&L is not available yet.",
         ]
     )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
-def _pnl_message(state):
-    completed = [t for t in state["trades_today"] if t["status"] == "CLOSED"]
-    realized = sum(t.get("return_pct", 0.0) or 0.0 for t in completed)
+# ============================================================
+# /P&L
+# ============================================================
 
+def _pnl_message(
+    state,
+):
+
+    trades = _all_trades(
+        state
+    )
+
+    today = datetime.now(
+        TIMEZONE
+    ).date()
+
+    realized = 0.0
     unrealized = 0.0
+
+    trade_count = 0
+    wins = 0
+    losses = 0
     open_count = 0
 
-    for ticker in state["tickers"]:
-        for entry in state["active_entries"].get(ticker, []):
-            current = _latest_price(state, ticker)
-            if current is None:
-                continue
+    for trade in trades:
 
-            entry_price = float(entry["entry_price"])
-            if entry["direction"] == "LONG":
-                unrealized += (current / entry_price - 1) * 100
-            else:
-                unrealized += (entry_price / current - 1) * 100
+        value = (
+            trade.get(
+                "entry_time"
+            )
+            or trade.get(
+                "signal_time"
+            )
+        )
+
+        if not value:
+            continue
+
+        try:
+
+            trade_date = (
+                datetime.fromisoformat(
+                    str(value)
+                    .replace(
+                        "Z",
+                        "+00:00",
+                    )
+                )
+                .astimezone(
+                    TIMEZONE
+                )
+                .date()
+            )
+
+        except Exception:
+            continue
+
+        if trade_date != today:
+            continue
+
+        trade_count += 1
+
+        pnl = _trade_pnl(
+            trade
+        )
+
+        if _trade_is_closed(
+            trade
+        ):
+
+            if pnl is not None:
+
+                realized += pnl
+
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+
+        else:
+
             open_count += 1
 
-    total = realized + unrealized
+            if pnl is not None:
+                unrealized += pnl
+
+    total = (
+        realized
+        + unrealized
+    )
 
     return (
         "💰 TODAY'S P&L\n\n"
-        f"Realized strategy return: {_signed_pct(realized)}\n"
-        f"Unrealized strategy return: {_signed_pct(unrealized)}\n"
-        f"Total strategy return: {_signed_pct(total)}\n\n"
-        f"Trades: {len(state['trades_today'])}\n"
-        f"Wins: {sum(1 for t in completed if (t.get('return_pct') or 0) > 0)}\n"
-        f"Losses: {sum(1 for t in completed if (t.get('return_pct') or 0) < 0)}\n"
-        f"Open positions: {open_count}\n\n"
-        f"Portfolio: {_money(state.get('portfolio_equity'))}\n\n"
-        "Note: option orders are currently disabled, so dollar option P&L is not available yet."
+        f"Realized P&L: "
+        f"{_format_money(realized)}\n"
+        f"Unrealized P&L: "
+        f"{_format_money(unrealized)}\n"
+        f"Total P&L: "
+        f"{_format_money(total)}\n\n"
+        f"Trades: {trade_count}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Open positions: {open_count}"
     )
 
 
-def _signals_message(state):
-    signals = state["signals_today"][-10:]
+# ============================================================
+# /SIGNALS
+# ============================================================
 
-    lines = ["📡 RECENT SIGNALS", ""]
+def _signals_message(
+    state,
+):
 
-    if not signals:
-        lines.append("No qualifying signals today.")
-        return "\n".join(lines)
+    active = _active_entries(
+        state
+    )
 
-    for signal in signals:
-        lines.extend(
-            [
-                f"{signal['ticker']} — {signal['direction']}",
-                f"Signal: {signal['time'].strftime('%H:%M')} ET",
-                f"VWAP: {_money(signal['vwap'])}",
-                f"Signal close: {_money(signal['close'])}",
-                f"EMA9: {_money(signal['ema9'])}",
-                f"VWAP distance: {signal['distance_pct']:.2f}%",
-                f"Status: {signal['status']}",
-                "",
-            ]
+    lines = [
+        "📡 RECENT SIGNALS",
+        "",
+    ]
+
+    found = 0
+
+    for ticker in TICKERS:
+
+        entries = active.get(
+            ticker,
+            [],
         )
 
-    entered = sum(1 for s in state["signals_today"] if s["status"] == "ENTERED")
-    rejected = sum(1 for s in state["signals_today"] if s["status"].startswith("REJECTED"))
-    pending = sum(1 for s in state["signals_today"] if s["status"] == "PENDING ENTRY")
+        if not isinstance(
+            entries,
+            list,
+        ):
+            continue
 
-    lines.extend(
-        [
-            f"Total signals: {len(state['signals_today'])}",
-            f"Entered: {entered}",
-            f"Rejected: {rejected}",
-            f"Pending: {pending}",
-        ]
-    )
+        for entry in entries[-3:]:
 
-    return "\n".join(lines)
+            found += 1
 
+            signal_time = entry.get(
+                "signal_time"
+            )
 
-def _summary_message(state):
-    completed = [t for t in state["trades_today"] if t["status"] == "CLOSED"]
-    realized = sum(t.get("return_pct", 0.0) or 0.0 for t in completed)
+            if signal_time:
 
-    open_count = sum(
-        len(state["active_entries"].get(ticker, []))
-        for ticker in state["tickers"]
-    )
+                try:
 
-    unrealized = 0.0
-    for ticker in state["tickers"]:
-        for entry in state["active_entries"].get(ticker, []):
-            current = _latest_price(state, ticker)
-            if current is None:
-                continue
-            entry_price = float(entry["entry_price"])
-            if entry["direction"] == "LONG":
-                unrealized += (current / entry_price - 1) * 100
+                    display_time = (
+                        pd_timestamp_to_et(
+                            signal_time
+                        )
+                    )
+
+                except Exception:
+
+                    display_time = str(
+                        signal_time
+                    )
+
             else:
-                unrealized += (entry_price / current - 1) * 100
 
-    total = realized + unrealized
+                display_time = "N/A"
 
-    entered = sum(1 for s in state["signals_today"] if s["status"] == "ENTERED")
-    rejected = sum(1 for s in state["signals_today"] if s["status"].startswith("REJECTED"))
-    pending = sum(1 for s in state["signals_today"] if s["status"] == "PENDING ENTRY")
+            lines.extend(
+                [
+                    f"{ticker} — LONG",
+                    f"Signal: {display_time}",
+                    (
+                        f"VWAP: "
+                        f"${_safe_float(entry.get('signal_vwap')):.2f}"
+                        if _safe_float(
+                            entry.get(
+                                "signal_vwap"
+                            )
+                        )
+                        is not None
+                        else "VWAP: N/A"
+                    ),
+                    (
+                        f"Signal close: "
+                        f"${_safe_float(entry.get('signal_close')):.2f}"
+                        if _safe_float(
+                            entry.get(
+                                "signal_close"
+                            )
+                        )
+                        is not None
+                        else "Signal close: N/A"
+                    ),
+                    (
+                        f"EMA9: "
+                        f"${_safe_float(entry.get('signal_ema9')):.2f}"
+                        if _safe_float(
+                            entry.get(
+                                "signal_ema9"
+                            )
+                        )
+                        is not None
+                        else "EMA9: N/A"
+                    ),
+                    "Status: ENTERED",
+                    "",
+                ]
+            )
+
+    if found == 0:
+
+        return (
+            "📡 RECENT SIGNALS\n\n"
+            "No entered signals yet."
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+def pd_timestamp_to_et(
+    value,
+):
+
+    timestamp = pd_to_datetime(
+        value
+    )
+
+    return timestamp.strftime(
+        "%H:%M ET"
+    )
+
+
+def pd_to_datetime(
+    value,
+):
+
+    text = str(
+        value
+    )
+
+    timestamp = datetime.fromisoformat(
+        text.replace(
+            "Z",
+            "+00:00",
+        )
+    )
+
+    if timestamp.tzinfo is None:
+
+        timestamp = timestamp.replace(
+            tzinfo=TIMEZONE
+        )
+
+    return timestamp.astimezone(
+        TIMEZONE
+    )
+
+
+# ============================================================
+# /SUMMARY
+# ============================================================
+
+def _summary_message(
+    state,
+):
+
+    active = _active_entries(
+        state
+    )
+
+    position_count = sum(
+        len(entries)
+        for entries in active.values()
+        if isinstance(
+            entries,
+            list,
+        )
+    )
+
+    trades = _all_trades(
+        state
+    )
+
+    today = datetime.now(
+        TIMEZONE
+    ).date()
+
+    today_trades = []
+
+    for trade in trades:
+
+        value = (
+            trade.get(
+                "entry_time"
+            )
+            or trade.get(
+                "signal_time"
+            )
+        )
+
+        if not value:
+            continue
+
+        try:
+
+            trade_date = (
+                pd_to_datetime(
+                    value
+                ).date()
+            )
+
+        except Exception:
+            continue
+
+        if trade_date == today:
+
+            today_trades.append(
+                trade
+            )
+
+    realized = 0.0
+    wins = 0
+    losses = 0
+
+    for trade in today_trades:
+
+        if not _trade_is_closed(
+            trade
+        ):
+            continue
+
+        pnl = _trade_pnl(
+            trade
+        )
+
+        if pnl is None:
+            continue
+
+        realized += pnl
+
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+
+    mode = (
+        "PAPER"
+        if PAPER_MODE
+        else "LIVE"
+    )
 
     return (
         "📊 TODAY'S SUMMARY\n\n"
+
         "Bot\n"
-        f"- Status: {'🟢 ONLINE' if state['online'] else '🔴 OFFLINE'}\n"
-        f"- Mode: {'PAPER' if state['paper_mode'] else 'LIVE'}\n"
-        f"- Portfolio: {_money(state.get('portfolio_equity'))}\n\n"
+        "• Status: 🟢 ONLINE\n"
+        f"• Mode: {mode}\n\n"
+
         "Trading\n"
-        f"- Trades: {len(state['trades_today'])}\n"
-        f"- Wins: {sum(1 for t in completed if (t.get('return_pct') or 0) > 0)}\n"
-        f"- Losses: {sum(1 for t in completed if (t.get('return_pct') or 0) < 0)}\n"
-        f"- Open positions: {open_count}\n\n"
+        f"• Trades: {len(today_trades)}\n"
+        f"• Wins: {wins}\n"
+        f"• Losses: {losses}\n"
+        f"• Open positions: {position_count}\n\n"
+
         "P&L\n"
-        f"- Realized strategy: {_signed_pct(realized)}\n"
-        f"- Unrealized strategy: {_signed_pct(unrealized)}\n"
-        f"- Total strategy: {_signed_pct(total)}\n\n"
-        "Signals\n"
-        f"- Total: {len(state['signals_today'])}\n"
-        f"- Entered: {entered}\n"
-        f"- Rejected: {rejected}\n"
-        f"- Pending: {pending}\n"
+        f"• Realized: "
+        f"{_format_money(realized)}\n"
+        "• Unrealized: "
+        "See /positions\n\n"
+
+        "Strategy\n"
+        "• Direction: LONG ONLY\n"
+        "• Option: CALL ONLY\n"
+        "• Timeframe: 5m\n"
+        "• Start: 10:00 NY\n"
+        "• VWAP filter: 0.28%"
     )
 
 
+# ============================================================
+# /NOW
+# ============================================================
 
-def _overall_message(state):
-    trades = state.get("all_trades", [])
-    now = datetime.now(TIMEZONE)
-    periods = [
-        ("TODAY", now.date()),
-        ("THIS WEEK", now.date() - __import__("datetime").timedelta(days=now.weekday())),
-        ("THIS MONTH", now.replace(day=1).date()),
-        ("THIS YEAR", now.replace(month=1, day=1).date()),
+def _now_message(
+    state,
+):
+
+    history = _five_minute_history(
+        state
+    )
+
+    lines = [
+        "👀 CURRENT WATCH",
+        "",
     ]
 
-    lines = ["📊 OVERALL PERFORMANCE", ""]
+    for ticker in TICKERS:
 
-    for label, start_date in periods:
-        period_trades = [
-            t for t in trades
-            if t["entry_time"].date() >= start_date
-            and t["status"] == "CLOSED"
-        ]
+        rows = history.get(
+            ticker,
+            [],
+        )
 
-        wins = sum(1 for t in period_trades if (t.get("return_pct") or 0) > 0)
-        losses = sum(1 for t in period_trades if (t.get("return_pct") or 0) < 0)
-        breakeven = sum(1 for t in period_trades if (t.get("return_pct") or 0) == 0)
-        total = len(period_trades)
-        win_rate = (wins / total * 100) if total else 0.0
-        pnl = sum(t.get("return_pct", 0.0) or 0.0 for t in period_trades)
-
-        lines.extend([
-            label,
-            f"Trades: {total}",
-            f"Wins: {wins}",
-            f"Losses: {losses}",
-            f"Breakeven: {breakeven}",
-            f"Win rate: {win_rate:.2f}%",
-            f"P&L: {_signed_pct(pnl)}",
-            "",
-        ])
-
-    lines.append(
-        "Note: P&L shown here is strategy return, because option orders are currently disabled."
-    )
-    return "\n".join(lines)
-
-
-def _now_message(state):
-    lines = ["👀 NOW WATCHING", ""]
-
-    for ticker in state["tickers"]:
-        info = state["watching"].get(ticker)
-
-        if not info:
-            lines.append(f"{ticker} — ⏳ Waiting for market data")
+        if not rows:
+            lines.append(
+                f"{ticker}: waiting for data"
+            )
             continue
 
-        direction = info.get("direction", "—")
-        status = info.get("status", "WAITING")
-        missing = info.get("waiting_for", "Qualifying VWAP cross")
+        latest = rows[-1]
 
-        price = info.get("price")
-        vwap = info.get("vwap")
-        ema9 = info.get("ema9")
-
-        lines.append(
-            f"{ticker} — {direction}\n"
-            f"Price: {_money(price)} | VWAP: {_money(vwap)} | EMA9: {_money(ema9)}\n"
-            f"Waiting: {missing}\n"
-            f"Status: {status}\n"
+        close = _safe_float(
+            latest.get(
+                "close"
+            )
         )
 
-    return "\n".join(lines)
-
-
-async def handle_command(command, state):
-    if command == "/help":
-        return build_help()
-
-    if command == "/start":
-        return (
-            "🟢 BOT STATUS: ONLINE\n"
-            f"MODE: {'PAPER' if state['paper_mode'] else 'LIVE'}\n"
-            f"PORTFOLIO SIZE: {_money(state.get('portfolio_equity'))}"
-        )
-
-    if command == "/status":
-        last_update = state.get("last_market_update")
-        last_text = (
-            last_update.strftime("%H:%M:%S ET")
-            if last_update
-            else "N/A"
-        )
-
-        active = sum(
-            len(state["active_entries"].get(ticker, []))
-            for ticker in state["tickers"]
-        )
-
-        return (
-            f"{'🟢' if state['online'] else '🔴'} BOT STATUS: "
-            f"{'ONLINE' if state['online'] else 'OFFLINE'}\n\n"
-            f"Mode: {'PAPER' if state['paper_mode'] else 'LIVE'}\n"
-            "Market data: CONNECTED\n"
-            f"Alpaca: {'CONNECTED' if state['alpaca_connected'] else 'DISCONNECTED'}\n"
-            "Telegram: CONNECTED\n"
-            f"Last market update: {last_text}\n"
-            f"Active positions: {active}\n"
-            f"Trades today: {len(state['trades_today'])}"
-        )
-
-    if command == "/positions":
-        return _position_lines(state)
-
-    if command == "/trades":
-        return _trades_message(state)
-
-    if command in ("/p&l", "/pnl"):
-        return _pnl_message(state)
-
-    if command == "/signals":
-        return _signals_message(state)
-
-    if command == "/summary":
-        return _summary_message(state)
-
-    if command == "/overall":
-        return _overall_message(state)
-
-    if command == "/now":
-        return _now_message(state)
-
-    return "Unknown command. Send /help to see the available commands."
-
-
-async def telegram_poll_loop(state):
-    if not TELEGRAM_BOT_TOKEN:
-        print("Telegram is disabled: TELEGRAM_BOT_TOKEN is missing.")
-        return
-
-    print("Telegram command listener started.")
-
-    offset = 0
-
-    while True:
-        try:
-            result = await asyncio.to_thread(_get_updates, offset)
-
-            if not result or not result.get("ok"):
-                await asyncio.sleep(3)
-                continue
-
-            for update in result.get("result", []):
-                offset = update["update_id"] + 1
-
-                message = update.get("message") or {}
-                chat = message.get("chat") or {}
-                chat_id = str(chat.get("id", ""))
-
-                if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
-                    continue
-
-                text = (message.get("text") or "").strip().lower()
-
-                if not text.startswith("/"):
-                    continue
-
-                command = text.split()[0].split("@")[0]
-
-                response = await handle_command(command, state)
-                await send_message(response, chat_id=chat_id)
-
-        except Exception as exc:
-            print(f"Telegram listener error: {exc}")
-            await asyncio.sleep(5)
+        if close is None:
+            lines.append(
+                f"{ticker}: waiting for data"
+            )
+  
