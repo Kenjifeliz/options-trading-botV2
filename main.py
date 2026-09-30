@@ -489,9 +489,16 @@ def _option_details_from_symbol(symbol):
 
 
 def _get_all_option_orders():
-    """Fetch all account option orders, newest API versions included."""
+    """
+    Retrieve ALL account orders without filtering by the underlying stock
+    ticker symbols. Option orders use full OCC symbols, not AAPL/NVDA/etc.
+
+    We filter the returned orders ourselves. This also prints diagnostics so
+    the Railway log tells us exactly what Alpaca returned.
+    """
     all_orders = []
     after = None
+    page = 0
 
     while True:
         request_kwargs = {
@@ -499,8 +506,6 @@ def _get_all_option_orders():
             "limit": 500,
             "direction": "asc",
             "nested": False,
-            "asset_class": AssetClass.US_OPTION,
-            "symbols": TICKERS,
         }
 
         if after is not None:
@@ -510,30 +515,53 @@ def _get_all_option_orders():
             request = GetOrdersRequest(**request_kwargs)
             batch = trading_client.get_orders(filter=request) or []
         except Exception as exc:
-            print(f"Alpaca order-history import failed: {exc}")
+            print("========================================")
+            print("ALPACA ORDER HISTORY ERROR")
+            print("========================================")
+            print(f"{type(exc).__name__}: {exc}")
+            print("========================================")
             return all_orders
+
+        page += 1
+        print(
+            f"Alpaca order-history page {page}: "
+            f"{len(batch)} orders returned."
+        )
 
         if not batch:
             break
 
         all_orders.extend(batch)
 
+        # Show a small sample so we can diagnose the actual Alpaca response.
+        for order in batch[:10]:
+            print(
+                "  ORDER | "
+                f"symbol={getattr(order, 'symbol', None)} | "
+                f"side={getattr(order, 'side', None)} | "
+                f"status={getattr(order, 'status', None)} | "
+                f"qty={getattr(order, 'qty', None)} | "
+                f"filled={getattr(order, 'filled_qty', None)}"
+            )
+
         if len(batch) < 500:
             break
 
         last_time = _order_time(batch[-1])
         if last_time is None:
+            print(
+                "Could not determine pagination timestamp; "
+                "stopping order-history retrieval."
+            )
             break
 
-        # Move the next request just beyond the last submitted timestamp.
         after = last_time.to_pydatetime() + timedelta(microseconds=1)
 
-    # De-duplicate because pagination can overlap at timestamp boundaries.
     unique = {}
     for order in all_orders:
         unique[str(order.id)] = order
 
-    return sorted(
+    orders = sorted(
         unique.values(),
         key=lambda o: str(
             getattr(o, "filled_at", None)
@@ -542,6 +570,24 @@ def _get_all_option_orders():
         ),
     )
 
+    option_like = 0
+    filled_option_like = 0
+    for order in orders:
+        symbol = str(getattr(order, "symbol", ""))
+        if len(symbol) >= 15:
+            option_like += 1
+            if "filled" in str(getattr(order, "status", "")).lower():
+                filled_option_like += 1
+
+    print("========================================")
+    print("ALPACA ORDER HISTORY RESULT")
+    print("========================================")
+    print(f"Total unique account orders: {len(orders)}")
+    print(f"Option-looking orders:       {option_like}")
+    print(f"Filled option-looking orders: {filled_option_like}")
+    print("========================================")
+
+    return orders
 
 def _db_entry_order_ids():
     conn = sqlite3.connect(TRADE_DB_PATH)
@@ -694,8 +740,14 @@ def import_alpaca_trade_history():
     """Import missing historical option BUY/SELL activity from Alpaca."""
     orders = _get_all_option_orders()
     if not orders:
-        print("Alpaca history import: no option orders returned.")
+        print("Alpaca history import: no account orders returned.")
         return 0
+
+    print(
+        "Alpaca history import: "
+        f"{len(orders)} account orders retrieved; "
+        "scanning for filled CALL option orders."
+    )
 
     existing_ids = _db_entry_order_ids()
     imported_entries = []
@@ -2875,13 +2927,6 @@ async def main():
                 "Telegram listener failed:"
             )
             print(exc)
-
-    # --------------------------------------------------------
-    # CONTINUOUS POSITION RECONCILIATION
-    # --------------------------------------------------------
-
-    asyncio.create_task(reconciliation_loop())
-    print("Alpaca position reconciliation loop started (30s).")
 
     # --------------------------------------------------------
     # LIVE STREAM
