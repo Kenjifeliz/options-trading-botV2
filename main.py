@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, date
@@ -456,40 +457,47 @@ def _order_time(order):
         return None
 
 
+OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
+
+
 def _option_details_from_symbol(symbol):
-    """Parse a standard 21-character OCC option symbol."""
-    symbol = str(symbol or "")
-    if len(symbol) < 15:
+    """Parse an OCC option symbol (Alpaca format, ticker NOT padded).
+
+    Example: AAPL261016C00250000
+    """
+    match = OCC_RE.match(str(symbol or "").strip())
+    if not match:
         return None
 
-    underlying = symbol[:6].strip()
+    underlying, yymmdd, cp, strike_raw = match.groups()
+
     if underlying not in TICKERS:
-        return None
-
-    # OCC layout: UNDERLYING(6) + YYMMDD(6) + C/P(1) + STRIKE(8)
-    option_type_code = symbol[12:13].upper()
-    if option_type_code not in ("C", "P"):
         return None
 
     try:
         expiration = datetime.strptime(
-            symbol[6:12],
+            yymmdd,
             "%y%m%d",
         ).date()
-        strike = int(symbol[13:21]) / 1000.0
     except Exception:
         return None
 
     return {
         "ticker": underlying,
-        "option_type": "CALL" if option_type_code == "C" else "PUT",
+        "option_type": "CALL" if cp == "C" else "PUT",
         "expiration": expiration,
-        "strike": strike,
+        "strike": int(strike_raw) / 1000.0,
     }
 
 
 def _get_all_option_orders():
-    """Fetch all account option orders, newest API versions included."""
+    """Fetch all account option orders.
+
+    NOTE: we do NOT filter by "symbols" here. Option orders are listed
+    under the option contract symbol (e.g. AAPL261016C00250000), not the
+    underlying ticker, so filtering by TICKERS returned nothing.
+    The underlying filter is applied later by _option_details_from_symbol().
+    """
     all_orders = []
     after = None
 
@@ -500,7 +508,6 @@ def _get_all_option_orders():
             "direction": "asc",
             "nested": False,
             "asset_class": AssetClass.US_OPTION,
-            "symbols": TICKERS,
         }
 
         if after is not None:
