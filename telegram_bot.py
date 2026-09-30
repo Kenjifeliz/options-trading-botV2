@@ -42,8 +42,8 @@ ALPACA_PAPER = (
     os.environ.get("ALPACA_PAPER", "true").lower() == "true"
 )
 
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_API_KEY = os.environ.get("APCA_API_KEY_ID", "")
+ALPACA_SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY", "")
 
 _trading_client = None
 
