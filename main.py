@@ -17,12 +17,15 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
     GetOptionContractsRequest,
+    GetOrdersRequest,
 )
 from alpaca.trading.enums import (
     OrderSide,
     TimeInForce,
     ContractType,
     AssetStatus,
+    AssetClass,
+    QueryOrderStatus,
 )
 
 try:
@@ -427,6 +430,315 @@ def load_persistent_trades():
 
 
 # ============================================================
+# ALPACA TRADE HISTORY IMPORT
+#
+# The original bot did not have a persistent local database
+# on Railway, so the authoritative historical record is Alpaca.
+# On startup we import filled option BUY orders for this bot's
+# 19-symbol universe into SQLite, then pair filled SELL orders
+# against those imported BUYs using FIFO.
+#
+# Strategy-specific fields that Alpaca does not know (VWAP,
+# EMA9, signal candle, etc.) are intentionally left blank.
+# ============================================================
+
+def _order_time(order):
+    value = (
+        getattr(order, "filled_at", None)
+        or getattr(order, "submitted_at", None)
+        or getattr(order, "created_at", None)
+    )
+    if value is None:
+        return None
+    try:
+        return pd.Timestamp(value)
+    except Exception:
+        return None
+
+
+def _option_details_from_symbol(symbol):
+    """Parse a standard 21-character OCC option symbol."""
+    symbol = str(symbol or "")
+    if len(symbol) < 15:
+        return None
+
+    underlying = symbol[:6].strip()
+    if underlying not in TICKERS:
+        return None
+
+    # OCC layout: UNDERLYING(6) + YYMMDD(6) + C/P(1) + STRIKE(8)
+    option_type_code = symbol[12:13].upper()
+    if option_type_code not in ("C", "P"):
+        return None
+
+    try:
+        expiration = datetime.strptime(
+            symbol[6:12],
+            "%y%m%d",
+        ).date()
+        strike = int(symbol[13:21]) / 1000.0
+    except Exception:
+        return None
+
+    return {
+        "ticker": underlying,
+        "option_type": "CALL" if option_type_code == "C" else "PUT",
+        "expiration": expiration,
+        "strike": strike,
+    }
+
+
+def _get_all_option_orders():
+    """Fetch all account option orders, newest API versions included."""
+    all_orders = []
+    after = None
+
+    while True:
+        request_kwargs = {
+            "status": QueryOrderStatus.ALL,
+            "limit": 500,
+            "direction": "asc",
+            "nested": False,
+            "asset_class": AssetClass.US_OPTION,
+            "symbols": TICKERS,
+        }
+
+        if after is not None:
+            request_kwargs["after"] = after
+
+        try:
+            request = GetOrdersRequest(**request_kwargs)
+            batch = trading_client.get_orders(filter=request) or []
+        except Exception as exc:
+            print(f"Alpaca order-history import failed: {exc}")
+            return all_orders
+
+        if not batch:
+            break
+
+        all_orders.extend(batch)
+
+        if len(batch) < 500:
+            break
+
+        last_time = _order_time(batch[-1])
+        if last_time is None:
+            break
+
+        # Move the next request just beyond the last submitted timestamp.
+        after = last_time.to_pydatetime() + timedelta(microseconds=1)
+
+    # De-duplicate because pagination can overlap at timestamp boundaries.
+    unique = {}
+    for order in all_orders:
+        unique[str(order.id)] = order
+
+    return sorted(
+        unique.values(),
+        key=lambda o: str(
+            getattr(o, "filled_at", None)
+            or getattr(o, "submitted_at", None)
+            or getattr(o, "created_at", None)
+        ),
+    )
+
+
+def _db_entry_order_ids():
+    conn = sqlite3.connect(TRADE_DB_PATH)
+    rows = conn.execute(
+        "SELECT entry_order_id FROM trades WHERE entry_order_id IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    return {str(row[0]) for row in rows if row[0]}
+
+
+def _insert_imported_entry(order, details):
+    fill_qty = getattr(order, "filled_qty", None)
+    fill_price = getattr(order, "filled_avg_price", None)
+    order_time = _order_time(order)
+
+    if fill_qty is None or float(fill_qty) <= 0 or order_time is None:
+        return None
+
+    entry = {
+        "ticker": details["ticker"],
+        "direction": "LONG",
+        "option_symbol": str(order.symbol),
+        "option_type": details["option_type"],
+        "strike": details["strike"],
+        "expiration": details["expiration"],
+        "contracts": int(float(fill_qty)),
+        "signal_time": order_time,
+        "entry_time": order_time,
+        "entry_underlying": None,
+        "entry_option": float(fill_price) if fill_price is not None else None,
+        "entry_order_id": str(order.id),
+        "signal_close": None,
+        "signal_vwap": None,
+        "signal_ema9": None,
+        "vwap_distance_pct": None,
+        "exit_time": None,
+        "exit_underlying": None,
+        "exit_option": None,
+        "exit_order_id": None,
+        "exit_reason": None,
+        "pnl": None,
+    }
+
+    save_trade_entry(entry)
+    return entry
+
+
+def _apply_imported_sell_fifo(imported_entries, sell_orders):
+    """Close imported BUY entries against later SELL fills, FIFO."""
+    by_symbol = defaultdict(list)
+    for entry in imported_entries:
+        by_symbol[entry["option_symbol"]].append(entry)
+
+    for symbol in by_symbol:
+        by_symbol[symbol].sort(
+            key=lambda e: pd.Timestamp(e["entry_time"])
+        )
+
+    sells_by_symbol = defaultdict(list)
+    for order in sell_orders:
+        symbol = str(getattr(order, "symbol", ""))
+        if symbol in by_symbol:
+            sells_by_symbol[symbol].append(order)
+
+    for symbol in sells_by_symbol:
+        sells_by_symbol[symbol].sort(
+            key=lambda o: _order_time(o) or pd.Timestamp.min
+        )
+
+    for symbol, sells in sells_by_symbol.items():
+        queue = by_symbol[symbol]
+
+        for sell in sells:
+            remaining_sell = int(float(getattr(sell, "filled_qty", 0) or 0))
+            if remaining_sell <= 0:
+                continue
+
+            sell_price = (
+                float(sell.filled_avg_price)
+                if getattr(sell, "filled_avg_price", None) is not None
+                else None
+            )
+            sell_time = _order_time(sell)
+
+            while remaining_sell > 0 and queue:
+                entry = queue[0]
+                entry_qty = int(entry.get("contracts") or 0)
+
+                if entry_qty <= 0:
+                    queue.pop(0)
+                    continue
+
+                matched_qty = min(entry_qty, remaining_sell)
+
+                # Full match: close the imported DB trade normally.
+                if matched_qty == entry_qty:
+                    entry["exit_time"] = sell_time
+                    entry["exit_option"] = sell_price
+                    entry["exit_order_id"] = str(sell.id)
+                    entry["exit_reason"] = "ALPACA_HISTORY_IMPORT"
+                    if (
+                        entry.get("entry_option") is not None
+                        and sell_price is not None
+                    ):
+                        entry["pnl"] = (
+                            sell_price - float(entry["entry_option"])
+                        ) * matched_qty * 100
+                    save_trade_exit(entry)
+                    queue.pop(0)
+                else:
+                    # Partial sell: close the sold quantity as a separate
+                    # historical trade and leave the remainder OPEN.
+                    closed = dict(entry)
+                    closed["contracts"] = matched_qty
+                    closed["db_id"] = None
+                    closed["exit_time"] = sell_time
+                    closed["exit_option"] = sell_price
+                    closed["exit_order_id"] = str(sell.id)
+                    closed["exit_reason"] = "ALPACA_HISTORY_IMPORT"
+                    if (
+                        entry.get("entry_option") is not None
+                        and sell_price is not None
+                    ):
+                        closed["pnl"] = (
+                            sell_price - float(entry["entry_option"])
+                        ) * matched_qty * 100
+
+                    # Insert the closed split with a unique synthetic entry
+                    # order id so it cannot be imported twice.
+                    closed["entry_order_id"] = (
+                        f"{entry['entry_order_id']}:PARTIAL:{sell.id}"
+                    )
+                    save_trade_entry(closed)
+                    save_trade_exit(closed)
+
+                    entry["contracts"] = entry_qty - matched_qty
+                    # The original DB row remains OPEN with its reduced qty.
+                    conn = sqlite3.connect(TRADE_DB_PATH)
+                    conn.execute(
+                        "UPDATE trades SET contracts = ? WHERE id = ?",
+                        (entry["contracts"], entry["db_id"]),
+                    )
+                    conn.commit()
+                    conn.close()
+
+                remaining_sell -= matched_qty
+
+
+def import_alpaca_trade_history():
+    """Import missing historical option BUY/SELL activity from Alpaca."""
+    orders = _get_all_option_orders()
+    if not orders:
+        print("Alpaca history import: no option orders returned.")
+        return 0
+
+    existing_ids = _db_entry_order_ids()
+    imported_entries = []
+    sell_orders = []
+
+    for order in orders:
+        status = str(getattr(order, "status", "")).lower()
+        if "filled" not in status:
+            continue
+
+        symbol = str(getattr(order, "symbol", ""))
+        details = _option_details_from_symbol(symbol)
+        if details is None:
+            continue
+
+        # The bot is CALL-only. Do not turn historical PUT orders into bot
+        # trades if the account happened to contain unrelated puts.
+        if details["option_type"] != "CALL":
+            continue
+
+        side = str(getattr(order, "side", "")).lower()
+        if side in ("buy", "orderside.buy"):
+            order_id = str(order.id)
+            if order_id in existing_ids:
+                continue
+            entry = _insert_imported_entry(order, details)
+            if entry is not None:
+                imported_entries.append(entry)
+                existing_ids.add(order_id)
+        elif side in ("sell", "orderside.sell"):
+            sell_orders.append(order)
+
+    if imported_entries:
+        _apply_imported_sell_fifo(imported_entries, sell_orders)
+
+    print(
+        "Alpaca history import: "
+        f"{len(imported_entries)} new CALL entries imported."
+    )
+    return len(imported_entries)
+
+
+# ============================================================
 # PERSISTENCE / ALPACA RECONCILIATION
 # ============================================================
 
@@ -471,7 +783,7 @@ def _position_map():
 
 def _latest_filled_sell(symbol, after_time=None):
     try:
-        orders = trading_client.get_orders()
+        orders = _get_all_option_orders()
     except Exception:
         return None
 
@@ -494,7 +806,12 @@ def _latest_filled_sell(symbol, after_time=None):
 
     if not candidates:
         return None
-    candidates.sort(key=lambda o: str(getattr(o, "filled_at", None) or getattr(o, "submitted_at", None)))
+    candidates.sort(
+        key=lambda o: str(
+            getattr(o, "filled_at", None)
+            or getattr(o, "submitted_at", None)
+        )
+    )
     return candidates[-1]
 
 
@@ -2441,6 +2758,19 @@ async def main():
         f"{len(all_trades)}"
     )
 
+    # Alpaca is the authoritative source for trades that happened before
+    # this Railway deployment. Import anything not already in SQLite.
+    try:
+        imported_count = import_alpaca_trade_history()
+        if imported_count:
+            all_trades = load_persistent_trades()
+            print(
+                f"Trades after Alpaca import: {len(all_trades)}"
+            )
+    except Exception as exc:
+        print(f"Alpaca trade-history import failed: {exc}")
+        notify(f"⚠️ Alpaca trade-history import failed\n{exc}")
+
     rebuild_active_entries_from_database()
     restore_pending_entries_from_database()
 
@@ -2457,6 +2787,10 @@ async def main():
     except Exception as exc:
         print(f"Startup Alpaca reconciliation failed: {exc}")
         notify(f"⚠️ Startup position reconciliation failed\n{exc}")
+
+    # Keep the internal state synchronized with Alpaca while the bot runs.
+    asyncio.create_task(reconciliation_loop())
+    print("Alpaca position reconciliation loop started (30s).")
 
     # --------------------------------------------------------
     # LOAD TODAY'S HISTORY
