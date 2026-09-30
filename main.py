@@ -105,9 +105,15 @@ PAPER_MODE = (
     == "true"
 )
 
+DEFAULT_DB_PATH = (
+    "/data/trade_history.db"
+    if os.path.isdir("/data")
+    else "trade_history.db"
+)
+
 TRADE_DB_PATH = os.environ.get(
     "TRADE_DB_PATH",
-    "trade_history.db"
+    DEFAULT_DB_PATH
 )
 
 
@@ -157,6 +163,7 @@ print(
     f"Alpaca paper:    "
     f"{'YES' if PAPER_MODE else 'NO'}"
 )
+print(f"Trade DB:         {TRADE_DB_PATH}")
 print("========================================")
 print()
 
@@ -191,10 +198,11 @@ def notify(message):
 
 def init_trade_database():
 
-    conn = sqlite3.connect(
-        TRADE_DB_PATH
-    )
+    db_dir = os.path.dirname(os.path.abspath(TRADE_DB_PATH))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
 
+    conn = sqlite3.connect(TRADE_DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute(
@@ -225,8 +233,76 @@ def init_trade_database():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            signal_time TEXT NOT NULL,
+            signal_close REAL NOT NULL,
+            signal_vwap REAL NOT NULL,
+            signal_ema9 REAL NOT NULL,
+            distance_pct REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(ticker, signal_time)
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
+
+
+def persist_pending_signal(ticker, pending):
+    conn = sqlite3.connect(TRADE_DB_PATH)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO pending_signals
+        (ticker, signal_time, signal_close, signal_vwap, signal_ema9, distance_pct, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ticker,
+            str(pending["signal_time"]),
+            pending["signal_close"],
+            pending["signal_vwap"],
+            pending["signal_ema9"],
+            pending["distance_pct"],
+            datetime.now(TIMEZONE).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_pending_signal(ticker, signal_time):
+    conn = sqlite3.connect(TRADE_DB_PATH)
+    conn.execute(
+        "DELETE FROM pending_signals WHERE ticker = ? AND signal_time = ?",
+        (ticker, str(signal_time)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_persistent_pending_signals():
+    conn = sqlite3.connect(TRADE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM pending_signals ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "ticker": row["ticker"],
+            "signal_time": pd.Timestamp(row["signal_time"]),
+            "signal_close": float(row["signal_close"]),
+            "signal_vwap": float(row["signal_vwap"]),
+            "signal_ema9": float(row["signal_ema9"]),
+            "distance_pct": float(row["distance_pct"]),
+        }
+        for row in rows
+    ]
 
 
 def save_trade_entry(entry):
@@ -351,6 +427,187 @@ def load_persistent_trades():
 
 
 # ============================================================
+# PERSISTENCE / ALPACA RECONCILIATION
+# ============================================================
+
+def rebuild_active_entries_from_database():
+    for ticker in TICKERS:
+        active_entries[ticker] = []
+
+    for trade in all_trades:
+        if str(trade.get("status", "")).upper() != "OPEN":
+            continue
+        ticker = trade.get("ticker")
+        if ticker not in active_entries:
+            continue
+        trade["db_id"] = int(trade["id"]) if trade.get("id") is not None else None
+        trade["contracts"] = int(float(trade.get("contracts") or 0))
+        trade["entry_underlying"] = float(trade["entry_underlying"]) if trade.get("entry_underlying") is not None else None
+        trade["entry_option"] = float(trade["entry_option"]) if trade.get("entry_option") is not None else None
+        trade["entry_time"] = pd.Timestamp(trade["entry_time"])
+        trade["signal_time"] = pd.Timestamp(trade["signal_time"])
+        trade["expiration"] = str(trade.get("expiration") or "")
+        active_entries[ticker].append(trade)
+
+
+def _position_map():
+    positions = {}
+    try:
+        for position in trading_client.get_all_positions():
+            symbol = str(position.symbol)
+            try:
+                qty = int(float(position.qty))
+            except Exception:
+                qty = 0
+            positions[symbol] = {
+                "qty": qty,
+                "avg_entry_price": float(position.avg_entry_price) if getattr(position, "avg_entry_price", None) is not None else None,
+            }
+    except Exception as exc:
+        print(f"Alpaca position reconciliation failed: {exc}")
+        return None
+    return positions
+
+
+def _latest_filled_sell(symbol, after_time=None):
+    try:
+        orders = trading_client.get_orders()
+    except Exception:
+        return None
+
+    candidates = []
+    for order in orders or []:
+        if str(getattr(order, "symbol", "")) != symbol:
+            continue
+        if str(getattr(order, "side", "")).lower() not in ("sell", "orderside.sell"):
+            continue
+        if "filled" not in str(getattr(order, "status", "")).lower():
+            continue
+        submitted = getattr(order, "submitted_at", None) or getattr(order, "filled_at", None)
+        if after_time is not None and submitted is not None:
+            try:
+                if pd.Timestamp(submitted) < pd.Timestamp(after_time):
+                    continue
+            except Exception:
+                pass
+        candidates.append(order)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda o: str(getattr(o, "filled_at", None) or getattr(o, "submitted_at", None)))
+    return candidates[-1]
+
+
+def mark_entry_external_close(entry, current_time, reason="MANUAL_CLOSE"):
+    symbol = entry.get("option_symbol")
+    order = _latest_filled_sell(symbol, entry.get("entry_time"))
+    exit_price = None
+    exit_order_id = None
+    exit_time = current_time
+
+    if order is not None:
+        exit_order_id = str(order.id)
+        if getattr(order, "filled_avg_price", None) is not None:
+            exit_price = float(order.filled_avg_price)
+        if getattr(order, "filled_at", None) is not None:
+            exit_time = pd.Timestamp(order.filled_at)
+
+    entry_price = entry.get("entry_option")
+    qty = int(entry.get("contracts") or 0)
+    pnl = None
+    if entry_price is not None and exit_price is not None:
+        pnl = (float(exit_price) - float(entry_price)) * qty * 100
+
+    entry["exit_time"] = exit_time
+    entry["exit_underlying"] = None
+    entry["exit_option"] = exit_price
+    entry["exit_order_id"] = exit_order_id
+    entry["exit_reason"] = reason
+    entry["pnl"] = pnl
+    save_trade_exit(entry)
+
+    pnl_text = f"${pnl:+.2f}" if pnl is not None else "N/A"
+    notify(
+        f"⚠️ POSITION CLOSED OUTSIDE BOT\n"
+        f"{entry.get('ticker')} — LONG CALL\n"
+        f"Contract: {symbol}\n"
+        f"Contracts: {qty}\n"
+        f"Exit: {('$'+format(exit_price, '.2f')) if exit_price is not None else 'N/A'}\n"
+        f"P&L: {pnl_text}\n"
+        f"Reason: {reason}"
+    )
+
+
+def reconcile_alpaca_positions(notify_changes=True):
+    positions = _position_map()
+    if positions is None:
+        return False
+
+    now = datetime.now(TIMEZONE)
+    changed = False
+
+    for ticker in TICKERS:
+        entries = active_entries[ticker]
+        if not entries:
+            continue
+
+        by_symbol = defaultdict(list)
+        for entry in entries:
+            by_symbol[str(entry.get("option_symbol"))].append(entry)
+
+        new_entries = []
+        for symbol, symbol_entries in by_symbol.items():
+            actual_qty = int(positions.get(symbol, {}).get("qty", 0))
+            expected_qty = sum(int(e.get("contracts") or 0) for e in symbol_entries)
+
+            if actual_qty <= 0:
+                for entry in symbol_entries:
+                    mark_entry_external_close(entry, now, "MANUAL_CLOSE")
+                changed = True
+                continue
+
+            if actual_qty >= expected_qty:
+                new_entries.extend(symbol_entries)
+                continue
+
+            # Partial external close: reconcile the newest bot entries first.
+            remaining_qty = actual_qty
+            for entry in reversed(symbol_entries):
+                qty = int(entry.get("contracts") or 0)
+                if remaining_qty >= qty:
+                    new_entries.insert(0, entry)
+                    remaining_qty -= qty
+                elif remaining_qty > 0:
+                    closed_qty = qty - remaining_qty
+                    clone = dict(entry)
+                    clone["contracts"] = remaining_qty
+                    new_entries.insert(0, clone)
+                    closed = dict(entry)
+                    closed["contracts"] = closed_qty
+                    mark_entry_external_close(closed, now, "MANUAL_PARTIAL_CLOSE")
+                    remaining_qty = 0
+                    changed = True
+                else:
+                    mark_entry_external_close(entry, now, "MANUAL_CLOSE")
+                    changed = True
+
+        active_entries[ticker] = new_entries
+
+    return changed
+
+
+async def reconciliation_loop():
+    while True:
+        try:
+            await asyncio.to_thread(reconcile_alpaca_positions)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"Position reconciliation error: {exc}")
+        await asyncio.sleep(30)
+
+
+# ============================================================
 # STATE
 # ============================================================
 
@@ -390,6 +647,22 @@ last_eod_date = {
     ticker: None
     for ticker in TICKERS
 }
+
+
+# Restore persisted pending signals after state containers exist.
+def restore_pending_entries_from_database():
+    for pending in load_persistent_pending_signals():
+        ticker = pending.pop("ticker")
+        # Pending signals older than one 5-minute bucket are stale.
+        signal_time = pd.Timestamp(pending["signal_time"])
+        now = datetime.now(TIMEZONE)
+        if signal_time.date() != now.date():
+            remove_pending_signal(ticker, signal_time)
+            continue
+        if (now - signal_time).total_seconds() > 5 * 60:
+            remove_pending_signal(ticker, signal_time)
+            continue
+        pending_entries[ticker].append(pending)
 
 
 # ============================================================
@@ -1307,6 +1580,8 @@ def queue_valid_signal(
         pending
     )
 
+    persist_pending_signal(ticker, pending)
+
     print()
     print(
         "========================================"
@@ -1443,6 +1718,7 @@ def execute_pending_open(
                 f"Signal EMA9: "
                 f"${signal_ema9:.2f}"
             )
+            remove_pending_signal(ticker, pending["signal_time"])
 
             continue
 
@@ -1804,9 +2080,9 @@ def check_end_of_day(
 
     # No new entry may come from
     # the final candle.
-    pending_entries[
-        ticker
-    ] = []
+    for pending in pending_entries[ticker]:
+        remove_pending_signal(ticker, pending["signal_time"])
+    pending_entries[ticker] = []
 
     if not active_entries[
         ticker
@@ -2165,6 +2441,23 @@ async def main():
         f"{len(all_trades)}"
     )
 
+    rebuild_active_entries_from_database()
+    restore_pending_entries_from_database()
+
+    print(
+        "Recovered OPEN bot positions: "
+        + str(sum(len(v) for v in active_entries.values()))
+    )
+
+    # Reconcile persisted bot positions against the actual Alpaca account
+    # BEFORE the live stream starts. This also catches manual closes and
+    # prevents stale database positions from being treated as active.
+    try:
+        reconcile_alpaca_positions()
+    except Exception as exc:
+        print(f"Startup Alpaca reconciliation failed: {exc}")
+        notify(f"⚠️ Startup position reconciliation failed\n{exc}")
+
     # --------------------------------------------------------
     # LOAD TODAY'S HISTORY
     # --------------------------------------------------------
@@ -2248,6 +2541,13 @@ async def main():
                 "Telegram listener failed:"
             )
             print(exc)
+
+    # --------------------------------------------------------
+    # CONTINUOUS POSITION RECONCILIATION
+    # --------------------------------------------------------
+
+    asyncio.create_task(reconciliation_loop())
+    print("Alpaca position reconciliation loop started (30s).")
 
     # --------------------------------------------------------
     # LIVE STREAM
