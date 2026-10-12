@@ -104,8 +104,8 @@ def ticker_config(ticker):
 def _clock(value):
     return datetime.strptime(value, "%H:%M").time()
 
-# SIP is the default consolidated feed. IEX is available only as an explicit override.
-DATA_FEED_NAME = os.environ.get("ALPACA_DATA_FEED", "sip").strip().lower()
+# Free Alpaca Basic market-data default: IEX. SIP requires a paid data entitlement.
+DATA_FEED_NAME = os.environ.get("ALPACA_DATA_FEED", "iex").strip().lower()
 DATA_FEEDS = {"sip": DataFeed.SIP, "iex": DataFeed.IEX}
 if DATA_FEED_NAME not in DATA_FEEDS:
     raise ValueError("ALPACA_DATA_FEED must be 'sip' or 'iex'.")
@@ -1013,6 +1013,45 @@ last_eod_date = {ticker: None for ticker in MANAGED_TICKERS}
 five_minute_history = {ticker: [] for ticker in MANAGED_TICKERS}
 first_trade_by_minute = {ticker: {} for ticker in MANAGED_TICKERS}
 
+# Alpaca Basic/IEX allows unlimited minute-bar subscriptions but only 30 trade/quote
+# symbols. Subscribe to trade channels only for tickers with pending next-minute entries.
+MAX_IEX_TRADE_SYMBOLS = 30
+trade_subscribed_tickers = set()
+market_data_stream = None
+
+def ensure_trade_subscription(ticker):
+    """Subscribe to a ticker's trade channel while it has a pending entry."""
+    if DATA_FEED_NAME != "iex" or ticker in trade_subscribed_tickers:
+        return ticker in trade_subscribed_tickers
+    if market_data_stream is None:
+        return False
+    if len(trade_subscribed_tickers) >= MAX_IEX_TRADE_SYMBOLS:
+        print(f"IEX trade subscription cap ({MAX_IEX_TRADE_SYMBOLS}) reached; cannot subscribe {ticker} for next-open validation.")
+        notify(f"⚠️ IEX trade subscription cap reached; {ticker} entry timing may be missed.")
+        return False
+    try:
+        market_data_stream.subscribe_trades(handle_trade, ticker)
+        trade_subscribed_tickers.add(ticker)
+        print(f"IEX trade channel subscribed for pending entry: {ticker} ({len(trade_subscribed_tickers)}/{MAX_IEX_TRADE_SYMBOLS})")
+        return True
+    except Exception as exc:
+        print(f"Could not subscribe to IEX trades for {ticker}: {exc}")
+        notify(f"⚠️ Could not subscribe to IEX trades for {ticker}: {exc}")
+        return False
+
+def release_trade_subscription_if_idle(ticker):
+    """Release an IEX trade channel once no pending entries need it."""
+    if DATA_FEED_NAME != "iex" or ticker not in trade_subscribed_tickers or pending_entries.get(ticker):
+        return
+    try:
+        if market_data_stream is not None:
+            market_data_stream.unsubscribe_trades(ticker)
+        trade_subscribed_tickers.discard(ticker)
+        first_trade_by_minute[ticker].clear()
+        print(f"IEX trade channel released: {ticker} ({len(trade_subscribed_tickers)}/{MAX_IEX_TRADE_SYMBOLS})")
+    except Exception as exc:
+        print(f"Could not release IEX trade channel for {ticker}: {exc}")
+
 def refresh_telegram_five_minute_history(ticker):
     """Maintain completed 5-minute candles for existing Telegram commands only."""
     rows = one_minute_history[ticker]
@@ -1676,6 +1715,7 @@ def queue_valid_signal(ticker, previous, signal):
                    "threshold": threshold}
         pending_entries[ticker].append(pending)
         persist_pending_signal(ticker, pending)
+        ensure_trade_subscription(ticker)
         print(f"V3 SIGNAL {ticker} threshold={threshold_pct:.2f}% time={signal_time} close={close:.4f} VWAP={vwap:.4f} EMA9(open)={ema:.4f} ATR14={atr}")
         notify(f"📡 V3 GIVEBACK SIGNAL\n{ticker} | threshold {threshold_pct:.2f}%\nSignal: {signal_time.strftime('%H:%M')} ET\nClose: ${close:.2f} | VWAP: ${vwap:.2f}\nEMA9(open): ${ema:.2f} | ATR14: {float(atr):.4f}")
     # The first next-minute trade can arrive before the completed-bar callback queues this signal.
@@ -1715,6 +1755,7 @@ def execute_pending_open(ticker, timestamp, open_price):
             signal_vwap=float(pending["signal_vwap"]), signal_ema9=float(pending["signal_ema9"]),
             distance_pct=float(pending["distance_pct"]), atr14=pending.get("atr14"), threshold=pending.get("threshold"),
         )
+    release_trade_subscription_if_idle(ticker)
 
 
 # ============================================================
@@ -2168,22 +2209,25 @@ async def main():
     # LIVE STREAM
     # --------------------------------------------------------
 
+    global market_data_stream
     stream = StockDataStream(
         API_KEY,
         API_SECRET,
         feed=DATA_FEED,
     )
+    market_data_stream = stream
 
+    # IEX permits minute bars for all symbols, but Basic-plan trade channels are capped
+    # at 30. Subscribe bars for the complete V3 universe and trade events only for
+    # symbols with pending next-minute entries.
     for ticker in MANAGED_TICKERS:
+        stream.subscribe_bars(handle_bar, ticker)
 
-        stream.subscribe_bars(
-            handle_bar,
-            ticker,
-        )
-        stream.subscribe_trades(
-            handle_trade,
-            ticker,
-        )
+    pending_tickers = [ticker for ticker in MANAGED_TICKERS if pending_entries[ticker]]
+    for ticker in pending_tickers[:MAX_IEX_TRADE_SYMBOLS]:
+        ensure_trade_subscription(ticker)
+    if len(pending_tickers) > MAX_IEX_TRADE_SYMBOLS:
+        print(f"WARNING: {len(pending_tickers)} tickers have restored pending entries, exceeding IEX's {MAX_IEX_TRADE_SYMBOLS}-symbol trade-channel cap; some next-open checks cannot be streamed.")
 
 
     notify_startup()
