@@ -43,47 +43,73 @@ except Exception:
 # SETTINGS
 # ============================================================
 
+# V3 Giveback active universe: master 65 tickers minus the 14 explicitly removed.
 TICKERS = [
-    "AAPL",
-    "AMD",
-    "ASTS",
-    "BE",
-    "GOOG",
-    "HIMS",
-    "INTC",
-    "IREN",
-    "JPM",
-    "MRVL",
-    "NBIS",
-    "NVDA",
-    "ORCL",
-    "PLTR",
-    "QQQ",
-    "RKLB",
-    "SPCX",
-    "SPY",
-    "TSLA",
+    "AAL", "AAPL", "AMD", "AMZN", "ASTS", "AUR", "BABA", "BAC",
+    "BE", "CCL", "COIN", "CSCO", "ET", "F", "GME", "GOOG",
+    "GOOGL", "GRAB", "HIMS", "HOOD", "HPE", "INTC", "IREN", "JD",
+    "JPM", "LI", "MARA", "META", "MRVL", "MSFT", "MSTR", "MU",
+    "NBIS", "NIO", "NOK", "NVDA", "ORCL", "PFE", "PLTR", "QQQ",
+    "SNAP", "SOFI", "SOUN", "SPCX", "SPY", "T", "TSLA", "TSM",
+    "UAL", "VALE", "XPEV",
 ]
-
+REMOVED_TICKERS = [
+    "AVGO", "BTDR", "JBLU", "LCID", "OPEN", "OXY", "PLUG",
+    "QCOM", "RIOT", "RKLB", "SMCI", "UBER", "VZ", "RIVN",
+]
 TIMEZONE = ZoneInfo("America/New_York")
-
-TIMEFRAME_MINUTES = 5
-
-START_TIME = datetime.strptime(
-    "10:00",
-    "%H:%M"
-).time()
-
-FINAL_CANDLE_TIME = datetime.strptime(
-    "15:55",
-    "%H:%M"
-).time()
-
-CONTRACTS = 5
-
+# Track excluded tickers only when necessary to manage/reconcile legacy open positions.
+MANAGED_TICKERS = sorted(set(TICKERS) | set(REMOVED_TICKERS))
+TIMEFRAME_MINUTES = 1
 EMA_LENGTH = 9
+ATR_LENGTH = 14
+GIVEBACK_ACTIVATION_ATR = 1.5
+GIVEBACK_FRACTION = 0.35
+# Thresholds are backtest variants. By default one order is placed per signal candle,
+# using the highest configured threshold met; set true only if deliberately trading each
+# threshold variant as a separate overlapping position.
+PARALLEL_THRESHOLD_TRADES = os.environ.get("V3_PARALLEL_THRESHOLD_TRADES", "false").lower() == "true"
+FINAL_CANDLE_TIME = datetime.strptime("15:59", "%H:%M").time()
+CONTRACTS = int(os.environ.get("CONTRACTS", "5"))
 
-VWAP_DISTANCE_THRESHOLD = 0.28
+# Configured threshold variants run independently, as in the strategy register.
+# Threshold values are decimals (0.003 = 0.30%).
+DEFAULT_ENTRY_START = "10:00"
+DEFAULT_ENTRY_END = "15:55"
+DEFAULT_THRESHOLDS = (0.0030, 0.0035, 0.0040)
+CUSTOM_CONFIG = {
+    "AMD":  {"start": "11:45", "end": "14:45", "thresholds": (0.0030, 0.0035, 0.0040)},
+    "INTC": {"start": "14:30", "end": "15:45", "thresholds": (0.0030, 0.0035, 0.0040)},
+    "IREN": {"start": "11:30", "end": "15:55", "thresholds": (0.0030, 0.0035)},
+    "PLTR": {"start": "10:50", "end": "14:00", "thresholds": (0.0030,)},
+    "ASTS": {"start": "10:45", "end": "12:00", "thresholds": (0.0035,)},
+    "BE":   {"start": "10:30", "end": "11:00", "thresholds": (0.0040,)},
+    "GRAB": {"start": "11:45", "end": "13:15", "thresholds": (0.0040,)},
+    "MARA": {"start": "10:00", "end": "11:00", "thresholds": (0.0030,)},
+}
+
+EXPECTED_REMOVED = {"AVGO", "BTDR", "JBLU", "LCID", "OPEN", "OXY", "PLUG", "QCOM", "RIOT", "RKLB", "SMCI", "UBER", "VZ", "RIVN"}
+if set(TICKERS) & EXPECTED_REMOVED:
+    raise RuntimeError(f"Excluded tickers accidentally active: {sorted(set(TICKERS) & EXPECTED_REMOVED)}")
+if len(TICKERS) != 51 or len(set(TICKERS)) != 51:
+    raise RuntimeError(f"V3 active universe should contain 51 unique tickers; found {len(TICKERS)}")
+
+def ticker_config(ticker):
+    cfg = CUSTOM_CONFIG.get(ticker)
+    if cfg is None:
+        return {"start": DEFAULT_ENTRY_START, "end": DEFAULT_ENTRY_END,
+                "thresholds": DEFAULT_THRESHOLDS, "source": "standard"}
+    return {**cfg, "source": "custom"}
+
+def _clock(value):
+    return datetime.strptime(value, "%H:%M").time()
+
+# SIP is the default consolidated feed. IEX is available only as an explicit override.
+DATA_FEED_NAME = os.environ.get("ALPACA_DATA_FEED", "sip").strip().lower()
+DATA_FEEDS = {"sip": DataFeed.SIP, "iex": DataFeed.IEX}
+if DATA_FEED_NAME not in DATA_FEEDS:
+    raise ValueError("ALPACA_DATA_FEED must be 'sip' or 'iex'.")
+DATA_FEED = DATA_FEEDS[DATA_FEED_NAME]
 
 # ============================================================
 # ACTUAL ORDER EXECUTION
@@ -108,6 +134,11 @@ PAPER_MODE = (
     ).lower()
     == "true"
 )
+
+# Keep paper trading enabled by default, but require an explicit opt-in for live orders.
+if not PAPER_MODE and os.environ.get("ALLOW_LIVE_TRADING", "false").lower() != "true":
+    ORDERS_ENABLED = False
+    print("WARNING: live account selected without ALLOW_LIVE_TRADING=true; order submission disabled.")
 
 DEFAULT_DB_PATH = (
     "/data/trade_history.db"
@@ -151,9 +182,9 @@ print("OPTIONS TRADING BOT")
 print("========================================")
 print("Direction:       LONG ONLY")
 print("Option:          CALL ONLY")
-print("Timeframe:       5 minutes")
-print("Start time:      10:00 NY")
-print("Data feed:       IEX")
+print("Timeframe:       1 minute (V3 Giveback)")
+print("Entry windows:   ticker-specific V3 config")
+print(f"Data feed:       Alpaca {DATA_FEED_NAME.upper()}")
 print(f"Contracts:       {CONTRACTS}")
 print(
     f"VWAP filter:     "
@@ -248,11 +279,42 @@ def init_trade_database():
             signal_ema9 REAL NOT NULL,
             distance_pct REAL NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE(ticker, signal_time)
+            atr14 REAL,
+            threshold REAL,
+            UNIQUE(ticker, signal_time, threshold)
         )
         """
     )
 
+    # Backward-compatible migrations for V3 Giveback management state.
+    existing = {row[1] for row in cursor.execute("PRAGMA table_info(trades)").fetchall()}
+    for name, sql_type in [("atr14", "REAL"), ("peak_underlying", "REAL"),
+                           ("giveback_active", "INTEGER"), ("strategy_threshold", "REAL")]:
+        if name not in existing:
+            cursor.execute(f"ALTER TABLE trades ADD COLUMN {name} {sql_type}")
+    pending_cols = {row[1] for row in cursor.execute("PRAGMA table_info(pending_signals)").fetchall()}
+    for name, sql_type in [("atr14", "REAL"), ("threshold", "REAL")]:
+        if name not in pending_cols:
+            cursor.execute(f"ALTER TABLE pending_signals ADD COLUMN {name} {sql_type}")
+    # Migrate legacy pending table to allow separate threshold variants on the same candle.
+    table_sql_row = cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='pending_signals'").fetchone()
+    table_sql = (table_sql_row[0] or "") if table_sql_row else ""
+    normalized_table_sql = re.sub(r"\s+", "", table_sql).lower()
+    if "unique(ticker,signal_time)" in normalized_table_sql and "unique(ticker,signal_time,threshold)" not in normalized_table_sql:
+        cursor.execute("ALTER TABLE pending_signals RENAME TO pending_signals_legacy")
+        cursor.execute("""CREATE TABLE pending_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL, signal_time TEXT NOT NULL,
+            signal_close REAL NOT NULL, signal_vwap REAL NOT NULL, signal_ema9 REAL NOT NULL,
+            distance_pct REAL NOT NULL, created_at TEXT NOT NULL, atr14 REAL, threshold REAL,
+            UNIQUE(ticker, signal_time, threshold))""")
+        legacy_cols = {row[1] for row in cursor.execute("PRAGMA table_info(pending_signals_legacy)").fetchall()}
+        atr_expr = "atr14" if "atr14" in legacy_cols else "NULL"
+        threshold_expr = "threshold" if "threshold" in legacy_cols else "NULL"
+        cursor.execute(f"""INSERT OR IGNORE INTO pending_signals
+            (id,ticker,signal_time,signal_close,signal_vwap,signal_ema9,distance_pct,created_at,atr14,threshold)
+            SELECT id,ticker,signal_time,signal_close,signal_vwap,signal_ema9,distance_pct,created_at,{atr_expr},{threshold_expr}
+            FROM pending_signals_legacy""")
+        cursor.execute("DROP TABLE pending_signals_legacy")
     conn.commit()
     conn.close()
 
@@ -260,31 +322,23 @@ def init_trade_database():
 def persist_pending_signal(ticker, pending):
     conn = sqlite3.connect(TRADE_DB_PATH)
     conn.execute(
-        """
-        INSERT OR IGNORE INTO pending_signals
-        (ticker, signal_time, signal_close, signal_vwap, signal_ema9, distance_pct, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            ticker,
-            str(pending["signal_time"]),
-            pending["signal_close"],
-            pending["signal_vwap"],
-            pending["signal_ema9"],
-            pending["distance_pct"],
-            datetime.now(TIMEZONE).isoformat(),
-        ),
+        """INSERT OR IGNORE INTO pending_signals
+        (ticker, signal_time, signal_close, signal_vwap, signal_ema9, distance_pct, created_at, atr14, threshold)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ticker, str(pending["signal_time"]), pending["signal_close"],
+         pending["signal_vwap"], pending["signal_ema9"], pending["distance_pct"],
+         datetime.now(TIMEZONE).isoformat(), pending.get("atr14"), pending.get("threshold")),
     )
     conn.commit()
     conn.close()
 
 
-def remove_pending_signal(ticker, signal_time):
+def remove_pending_signal(ticker, signal_time, threshold=None):
     conn = sqlite3.connect(TRADE_DB_PATH)
-    conn.execute(
-        "DELETE FROM pending_signals WHERE ticker = ? AND signal_time = ?",
-        (ticker, str(signal_time)),
-    )
+    if threshold is None:
+        conn.execute("DELETE FROM pending_signals WHERE ticker = ? AND signal_time = ?", (ticker, str(signal_time)))
+    else:
+        conn.execute("DELETE FROM pending_signals WHERE ticker = ? AND signal_time = ? AND threshold = ?", (ticker, str(signal_time), float(threshold)))
     conn.commit()
     conn.close()
 
@@ -292,21 +346,15 @@ def remove_pending_signal(ticker, signal_time):
 def load_persistent_pending_signals():
     conn = sqlite3.connect(TRADE_DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT * FROM pending_signals ORDER BY id"
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM pending_signals ORDER BY id").fetchall()
     conn.close()
-    return [
-        {
-            "ticker": row["ticker"],
-            "signal_time": pd.Timestamp(row["signal_time"]),
-            "signal_close": float(row["signal_close"]),
-            "signal_vwap": float(row["signal_vwap"]),
-            "signal_ema9": float(row["signal_ema9"]),
-            "distance_pct": float(row["distance_pct"]),
-        }
-        for row in rows
-    ]
+    return [{
+        "ticker": row["ticker"], "signal_time": pd.Timestamp(row["signal_time"]),
+        "signal_close": float(row["signal_close"]), "signal_vwap": float(row["signal_vwap"]),
+        "signal_ema9": float(row["signal_ema9"]), "distance_pct": float(row["distance_pct"]),
+        "atr14": float(row["atr14"]) if "atr14" in row.keys() and row["atr14"] is not None else None,
+        "threshold": float(row["threshold"]) if "threshold" in row.keys() and row["threshold"] is not None else None,
+    } for row in rows]
 
 
 def save_trade_entry(entry):
@@ -333,9 +381,10 @@ def save_trade_entry(entry):
             entry_option,
             entry_order_id,
             status,
-            created_at
+            created_at,
+            atr14, peak_underlying, giveback_active, strategy_threshold
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             entry["ticker"],
@@ -352,6 +401,8 @@ def save_trade_entry(entry):
             entry["entry_order_id"],
             "OPEN",
             datetime.now(TIMEZONE).isoformat(),
+            entry.get("atr14"), entry.get("peak_underlying", entry.get("entry_underlying")),
+            int(bool(entry.get("giveback_active", False))), entry.get("strategy_threshold"),
         ),
     )
 
@@ -436,7 +487,7 @@ def load_persistent_trades():
 # The original bot did not have a persistent local database
 # on Railway, so the authoritative historical record is Alpaca.
 # On startup we import filled option BUY orders for this bot's
-# 19-symbol universe into SQLite, then pair filled SELL orders
+# managed 65-symbol universe into SQLite, then pair filled SELL orders
 # against those imported BUYs using FIFO.
 #
 # Strategy-specific fields that Alpaca does not know (VWAP,
@@ -471,7 +522,7 @@ def _option_details_from_symbol(symbol):
 
     underlying, yymmdd, cp, strike_raw = match.groups()
 
-    if underlying not in TICKERS:
+    if underlying not in MANAGED_TICKERS:
         return None
 
     try:
@@ -759,7 +810,7 @@ def import_alpaca_trade_history():
 # ============================================================
 
 def rebuild_active_entries_from_database():
-    for ticker in TICKERS:
+    for ticker in MANAGED_TICKERS:
         active_entries[ticker] = []
 
     for trade in all_trades:
@@ -879,7 +930,7 @@ def reconcile_alpaca_positions(notify_changes=True):
     now = datetime.now(TIMEZONE)
     changed = False
 
-    for ticker in TICKERS:
+    for ticker in MANAGED_TICKERS:
         entries = active_entries[ticker]
         if not entries:
             continue
@@ -944,57 +995,69 @@ async def reconciliation_loop():
 # STATE
 # ============================================================
 
-five_minute_history = {
-    ticker: []
-    for ticker in TICKERS
-}
-
-one_minute_history = {
-    ticker: []
-    for ticker in TICKERS
-}
-
-active_entries = {
-    ticker: []
-    for ticker in TICKERS
-}
-
-pending_entries = {
-    ticker: []
-    for ticker in TICKERS
-}
-
+one_minute_history = {ticker: [] for ticker in MANAGED_TICKERS}
+active_entries = {ticker: [] for ticker in MANAGED_TICKERS}
+pending_entries = {ticker: [] for ticker in MANAGED_TICKERS}
 all_trades = []
+last_processed_1m = {ticker: None for ticker in MANAGED_TICKERS}
+last_processed_open_minute = {ticker: None for ticker in MANAGED_TICKERS}
+last_eod_date = {ticker: None for ticker in MANAGED_TICKERS}
 
-last_processed_5m = {
-    ticker: None
-    for ticker in TICKERS
-}
+# Keep Telegram's legacy 5-minute history key and semantics separate from V3's 1-minute data.
+five_minute_history = {ticker: [] for ticker in MANAGED_TICKERS}
+first_trade_by_minute = {ticker: {} for ticker in MANAGED_TICKERS}
 
-last_processed_open_bucket = {
-    ticker: None
-    for ticker in TICKERS
-}
-
-last_eod_date = {
-    ticker: None
-    for ticker in TICKERS
-}
+def refresh_telegram_five_minute_history(ticker):
+    """Maintain completed 5-minute candles for existing Telegram commands only."""
+    rows = one_minute_history[ticker]
+    if not rows:
+        return
+    df = pd.DataFrame(rows).sort_values("time")
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.set_index("time")
+    agg = df.resample("5min", origin="start_day").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna(subset=["open", "high", "low", "close"])
+    # Only publish buckets whose final minute (xx:x4 or xx:x9) has completed.
+    if agg.empty:
+        return
+    current = pd.Timestamp(rows[-1]["time"])
+    completed = agg[agg.index + pd.Timedelta(minutes=4) <= current]
+    records = []
+    if not completed.empty:
+        completed = completed.copy()
+        completed["ticker"] = ticker
+        completed["ema9"] = completed["open"].ewm(span=EMA_LENGTH, adjust=False, min_periods=EMA_LENGTH).mean()
+        tp = (completed["high"] + completed["low"] + completed["close"]) / 3.0
+        completed["session_date"] = completed.index.date
+        pv = tp * completed["volume"].fillna(0)
+        cumulative_volume = completed["volume"].groupby(completed["session_date"]).cumsum()
+        completed["session_vwap"] = pv.groupby(completed["session_date"]).cumsum() / cumulative_volume.where(cumulative_volume != 0)
+        records = completed.reset_index(names="time").to_dict("records")[-500:]
+    five_minute_history[ticker] = records
 
 
 # Restore persisted pending signals after state containers exist.
 def restore_pending_entries_from_database():
     for pending in load_persistent_pending_signals():
         ticker = pending.pop("ticker")
-        # Pending signals older than one 5-minute bucket are stale.
+        if ticker not in pending_entries:
+            continue
+        # Pending signals older than the immediate next 1-minute candle are stale.
         signal_time = pd.Timestamp(pending["signal_time"])
         now = datetime.now(TIMEZONE)
         if signal_time.date() != now.date():
             remove_pending_signal(ticker, signal_time)
             continue
-        if (now - signal_time).total_seconds() > 5 * 60:
+        if (now - signal_time).total_seconds() > 2 * 60:
             remove_pending_signal(ticker, signal_time)
             continue
+        if pending.get("threshold") is None:
+            cfg = ticker_config(ticker)
+            pending["threshold"] = cfg["thresholds"][0]
+            conn = sqlite3.connect(TRADE_DB_PATH)
+            conn.execute("UPDATE pending_signals SET threshold=? WHERE ticker=? AND signal_time=? AND threshold IS NULL", (pending["threshold"], ticker, str(signal_time)))
+            conn.commit(); conn.close()
         pending_entries[ticker].append(pending)
 
 
@@ -1029,7 +1092,7 @@ def is_regular_session_time(timestamp):
             "%H:%M"
         ).time()
         <= t
-        <= datetime.strptime(
+        < datetime.strptime(
             "16:00",
             "%H:%M"
         ).time()
@@ -1041,331 +1104,97 @@ def is_regular_session_time(timestamp):
 # ============================================================
 
 def load_today_history():
-
-    now_ny = datetime.now(
-        TIMEZONE
-    )
-
-    market_open = now_ny.replace(
-        hour=9,
-        minute=30,
-        second=0,
-        microsecond=0,
-    )
-
-    end_time = now_ny - timedelta(
-        minutes=1
-    )
-
+    now_ny = datetime.now(TIMEZONE)
+    market_open = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
+    end_time = now_ny - timedelta(minutes=1)
     if end_time <= market_open:
         return pd.DataFrame()
 
-    print(
-        "Loading today's historical "
-        "IEX bars..."
-    )
+    print(f"Loading today's historical 1-minute Alpaca {DATA_FEED_NAME.upper()} bars...")
+    # Alpaca's bars limit applies to the entire multi-symbol response, not per symbol.
+    # Batch symbols so 65 tickers × ~390 bars cannot silently truncate at 10,000 rows.
+    frames = []
+    batch_size = 15
+    for offset in range(0, len(MANAGED_TICKERS), batch_size):
+        symbols = MANAGED_TICKERS[offset:offset + batch_size]
+        request = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+            start=market_open,
+            end=end_time,
+            feed=DATA_FEED,
+            limit=10000,
+        )
+        bars = historical_client.get_stock_bars(request)
+        part = bars.df.reset_index()
+        if part.empty:
+            continue
+        if "symbol" in part.columns:
+            part = part.rename(columns={"symbol": "ticker"})
+        frames.append(part)
 
-    request = StockBarsRequest(
-        symbol_or_symbols=TICKERS,
-        timeframe=TimeFrame(
-            1,
-            TimeFrameUnit.Minute,
-        ),
-        start=market_open,
-        end=end_time,
-        feed=DataFeed.IEX,
-        limit=10000,
-    )
+    if not frames:
+        return pd.DataFrame(columns=["ticker", "time", "open", "high", "low", "close", "volume", "vwap"])
+    df = pd.concat(frames, ignore_index=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(TIMEZONE)
+    df = df.rename(columns={"timestamp": "time"})
+    if "vwap" not in df.columns:
+        df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    return df[["ticker", "time", "open", "high", "low", "close", "volume", "vwap"]].sort_values(["ticker", "time"]).reset_index(drop=True)
 
-    bars = historical_client.get_stock_bars(
-        request
-    )
 
-    df = bars.df.reset_index()
-
+def add_v3_indicators(df):
+    """V3 indicators aligned with the current full-universe backtest notebook."""
     if df.empty:
         return df
-
-    if "symbol" in df.columns:
-        df = df.rename(
-            columns={
-                "symbol": "ticker"
-            }
-        )
-
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        utc=True,
+    df = df.sort_values("time").copy()
+    df["session_date"] = pd.to_datetime(df["time"]).dt.date
+    # EMA9 uses OPEN as explicitly required. Reset each session because only today's
+    # regular-session bars are loaded into the live process.
+    df["ema9"] = df.groupby("session_date")["open"].transform(
+        lambda x: x.ewm(span=EMA_LENGTH, adjust=False, min_periods=EMA_LENGTH).mean()
     )
-
-    df["timestamp"] = (
-        df["timestamp"]
-        .dt.tz_convert(TIMEZONE)
+    # Match the V3 backtest notebook: session VWAP uses typical price weighted by volume.
+    minute_vwap = (df["high"] + df["low"] + df["close"]) / 3.0
+    df["_vwap_volume"] = minute_vwap * df["volume"].fillna(0)
+    df["_cum_vwap_volume"] = df.groupby("session_date")["_vwap_volume"].cumsum()
+    df["_cum_volume"] = df.groupby("session_date")["volume"].cumsum()
+    df["session_vwap"] = (df["_cum_vwap_volume"] / df["_cum_volume"].where(df["_cum_volume"] != 0))
+    prev_close = df.groupby("session_date", sort=False)["close"].shift(1)
+    tr = pd.concat(
+        [df["high"] - df["low"],
+         (df["high"] - prev_close).abs(),
+         (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    # Match the V3 backtest: first bar of each session uses high-low, not prior-session close.
+    first_bar = df.groupby("session_date", sort=False).cumcount().eq(0)
+    tr.loc[first_bar] = (df.loc[first_bar, "high"] - df.loc[first_bar, "low"])
+    df["atr14"] = tr.groupby(df["session_date"]).transform(
+        lambda x: x.ewm(alpha=1.0 / ATR_LENGTH, adjust=False, min_periods=ATR_LENGTH).mean()
     )
-
-    df = df.rename(
-        columns={
-            "timestamp": "time"
-        }
-    )
-
-    return df[
-        [
-            "ticker",
-            "time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-        ]
-    ].sort_values(
-        ["ticker", "time"]
-    ).reset_index(
-        drop=True
-    )
+    return df.drop(columns=["_vwap_volume", "_cum_vwap_volume", "_cum_volume"])
 
 
-# ============================================================
-# BUILD 5-MINUTE HISTORY
-# ============================================================
-
-def prepare_strategy_data(raw):
-
-    results = []
-
-    if raw.empty:
-        return pd.DataFrame()
-
-    for ticker in TICKERS:
-
-        ticker_df = raw[
-            raw["ticker"] == ticker
-        ].copy()
-
-        if ticker_df.empty:
-            continue
-
-        ticker_df = ticker_df.sort_values(
-            "time"
-        )
-
-        ticker_df = ticker_df.set_index(
-            "time"
-        )
-
-        five = ticker_df.resample(
-            "5min",
-            origin="start_day",
-        ).agg(
-            {
-                "ticker": "first",
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
-
-        five = five.dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        )
-
-        if five.empty:
-            continue
-
-        # EMA9
-        # TradingView setting:
-        # Length = 9
-        # Source = OPEN
-        # Offset = 0
-
-        five["ema9"] = (
-            five["open"]
-            .ewm(
-                span=EMA_LENGTH,
-                adjust=False,
-            )
-            .mean()
-        )
-
-        # Session VWAP
-        # TradingView setting:
-        # Anchor = Session
-        # Source = OPEN
-
-        five["session_date"] = (
-            five.index.date
-        )
-
-        five["open_volume"] = (
-            five["open"]
-            * five["volume"]
-        )
-
-        five["cum_open_volume"] = (
-            five.groupby(
-                "session_date"
-            )["open_volume"]
-            .cumsum()
-        )
-
-        five["cum_volume"] = (
-            five.groupby(
-                "session_date"
-            )["volume"]
-            .cumsum()
-        )
-
-        five["vwap"] = (
-            five["cum_open_volume"]
-            / five["cum_volume"]
-        )
-
-        five = five.reset_index()
-
-        results.append(
-            five[
-                [
-                    "ticker",
-                    "time",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "ema9",
-                    "vwap",
-                ]
-            ]
-        )
-
-    if not results:
-        return pd.DataFrame()
-
-    return pd.concat(
-        results,
-        ignore_index=True,
-    ).sort_values(
-        ["ticker", "time"]
-    ).reset_index(
-        drop=True
-    )
-
-
-def seed_history(five_df):
-
-    if five_df.empty:
+def seed_history(raw_df):
+    if raw_df.empty:
         return
-
     for ticker in TICKERS:
+        rows = raw_df[raw_df["ticker"] == ticker].sort_values("time")
+        one_minute_history[ticker] = rows.to_dict("records")[-1000:]
+        if not rows.empty:
+            last_processed_1m[ticker] = pd.Timestamp(rows.iloc[-1]["time"])
+            refresh_telegram_five_minute_history(ticker)
 
-        ticker_df = five_df[
-            five_df["ticker"] == ticker
-        ]
-
-        for _, row in ticker_df.iterrows():
-
-            five_minute_history[
-                ticker
-            ].append(
-                {
-                    "ticker": ticker,
-                    "time": pd.Timestamp(
-                        row["time"]
-                    ),
-                    "open": float(
-                        row["open"]
-                    ),
-                    "high": float(
-                        row["high"]
-                    ),
-                    "low": float(
-                        row["low"]
-                    ),
-                    "close": float(
-                        row["close"]
-                    ),
-                    "volume": float(
-                        row["volume"]
-                    ),
-                }
-            )
-
-        five_minute_history[
-            ticker
-        ] = (
-            five_minute_history[
-                ticker
-            ][-500:]
-        )
-
-
-# ============================================================
-# CALCULATE STRATEGY VALUES
-# ============================================================
 
 def build_strategy_df(ticker):
-
-    rows = five_minute_history[
-        ticker
-    ]
-
-    if len(rows) < 3:
+    rows = one_minute_history[ticker]
+    if len(rows) < 2:
         return pd.DataFrame()
-
-    df = pd.DataFrame(
-        rows
-    ).sort_values(
-        "time"
-    ).reset_index(
-        drop=True
-    )
-
-    df["ema9"] = (
-        df["open"]
-        .ewm(
-            span=EMA_LENGTH,
-            adjust=False,
-        )
-        .mean()
-    )
-
-    df["session_date"] = (
-        df["time"].dt.date
-    )
-
-    df["open_volume"] = (
-        df["open"]
-        * df["volume"]
-    )
-
-    df["cum_open_volume"] = (
-        df.groupby(
-            "session_date"
-        )["open_volume"]
-        .cumsum()
-    )
-
-    df["cum_volume"] = (
-        df.groupby(
-            "session_date"
-        )["volume"]
-        .cumsum()
-    )
-
-    df["vwap"] = (
-        df["cum_open_volume"]
-        / df["cum_volume"]
-    )
-
-    return df
+    df = pd.DataFrame(rows).sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
+    if "vwap" not in df.columns:
+        df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    return add_v3_indicators(df)
 
 
 # ============================================================
@@ -1541,6 +1370,8 @@ def execute_option_entry(
     signal_vwap,
     signal_ema9,
     distance_pct,
+    atr14=None,
+    threshold=None,
 ):
 
     if not ORDERS_ENABLED:
@@ -1748,9 +1579,11 @@ def execute_option_entry(
         "signal_ema9": float(
             signal_ema9
         ),
-        "vwap_distance_pct": float(
-            distance_pct
-        ),
+        "vwap_distance_pct": float(distance_pct),
+        "strategy_threshold": float(threshold) if threshold is not None else None,
+        "atr14": float(atr14) if atr14 is not None and pd.notna(atr14) else None,
+        "peak_underlying": float(underlying_open),
+        "giveback_active": False,
         "exit_time": None,
         "exit_underlying": None,
         "exit_option": None,
@@ -1795,299 +1628,87 @@ def execute_option_entry(
 # VALID SIGNAL
 # ============================================================
 
-def queue_valid_signal(
-    ticker,
-    previous,
-    signal,
-):
-
-    previous_time = pd.Timestamp(
-        previous["time"]
-    )
-
-    signal_time = pd.Timestamp(
-        signal["time"]
-    )
-
-    if (
-        previous_time.date()
-        != signal_time.date()
-    ):
+def queue_valid_signal(ticker, previous, signal):
+    # Removed tickers can be streamed to manage existing positions, but never open new V3 trades.
+    if ticker not in TICKERS:
         return
-
-    # Ignore everything before 10:00.
-    if (
-        signal_time.time()
-        < START_TIME
-    ):
+    signal_time = pd.Timestamp(signal["time"])
+    previous_time = pd.Timestamp(previous["time"])
+    if previous_time.date() != signal_time.date():
         return
-
-    # Never create a new signal on
-    # the final candle.
-    if (
-        signal_time.time()
-        >= FINAL_CANDLE_TIME
-    ):
+    cfg = ticker_config(ticker)
+    clock = signal_time.time()
+    if not (_clock(cfg["start"]) <= clock <= _clock(cfg["end"])):
         return
-
-    # --------------------------------------------------------
-    # LONG VWAP CROSS ONLY
-    # --------------------------------------------------------
-
-    long_cross = (
-        float(previous["close"])
-        <= float(previous["vwap"])
-        and
-        float(signal["close"])
-        > float(signal["vwap"])
-    )
-
-    if not long_cross:
+    if clock >= FINAL_CANDLE_TIME:
         return
-
-    signal_close = float(
-        signal["close"]
-    )
-
-    signal_vwap = float(
-        signal["vwap"]
-    )
-
-    if signal_vwap == 0:
+    if not (float(previous["close"]) <= float(previous["session_vwap"]) and float(signal["close"]) > float(signal["session_vwap"])):
         return
-
-    distance_pct = (
-        abs(
-            signal_close
-            - signal_vwap
-        )
-        / abs(signal_vwap)
-        * 100
-    )
-
-    # --------------------------------------------------------
-    # VWAP DISTANCE
-    # --------------------------------------------------------
-
-    if (
-        distance_pct
-        < VWAP_DISTANCE_THRESHOLD
-    ):
+    close = float(signal["close"]); vwap = float(signal["session_vwap"]); ema_value = signal["ema9"]
+    atr = signal.get("atr14")
+    # Match the backtest: no entry unless EMA9 and ATR14 are initialized on the signal candle.
+    if pd.isna(ema_value) or pd.isna(atr) or float(atr) <= 0 or vwap <= 0:
         return
-
-    # --------------------------------------------------------
-    # SIGNAL CANDLE MUST CLOSE ABOVE EMA9
-    # --------------------------------------------------------
-
-    signal_ema9 = float(
-        signal["ema9"]
-    )
-
-    if signal_close <= signal_ema9:
+    ema = float(ema_value)
+    if close <= ema:
         return
-
-    # --------------------------------------------------------
-    # NO DUPLICATE SIGNAL
-    # --------------------------------------------------------
-
-    if any(
-        pd.Timestamp(
-            p["signal_time"]
-        )
-        == signal_time
-        for p in pending_entries[ticker]
-    ):
+    distance_pct = (close / vwap - 1.0) * 100.0
+    eligible_thresholds = [t for t in cfg["thresholds"] if distance_pct + 1e-12 >= t * 100.0]
+    if not eligible_thresholds:
         return
-
-    pending = {
-        "signal_time": signal_time,
-        "signal_close": signal_close,
-        "signal_vwap": signal_vwap,
-        "signal_ema9": signal_ema9,
-        "distance_pct": distance_pct,
-    }
-
-    pending_entries[
-        ticker
-    ].append(
-        pending
-    )
-
-    persist_pending_signal(ticker, pending)
-
-    print()
-    print(
-        "========================================"
-    )
-    print("VALID LONG SIGNAL")
-    print(
-        "========================================"
-    )
-    print(
-        f"Ticker:          {ticker}"
-    )
-    print(
-        f"Signal time:     {signal_time}"
-    )
-    print(
-        f"Previous close:  "
-        f"{float(previous['close']):.4f}"
-    )
-    print(
-        f"Previous VWAP:   "
-        f"{float(previous['vwap']):.4f}"
-    )
-    print(
-        f"Signal close:    "
-        f"{signal_close:.4f}"
-    )
-    print(
-        f"Signal VWAP:     "
-        f"{signal_vwap:.4f}"
-    )
-    print(
-        f"VWAP distance:   "
-        f"{distance_pct:.4f}%"
-    )
-    print(
-        f"Signal EMA9:     "
-        f"{signal_ema9:.4f}"
-    )
-    print(
-        "Next candle:     WAITING FOR OPEN"
-    )
-    print(
-        "========================================"
-    )
-
-    notify(
-        f"📡 VALID LONG SIGNAL\n"
-        f"{ticker}\n"
-        f"Signal: "
-        f"{signal_time.strftime('%H:%M')} ET\n"
-        f"VWAP: ${signal_vwap:.2f}\n"
-        f"Close: ${signal_close:.2f}\n"
-        f"EMA9: ${signal_ema9:.2f}\n"
-        f"VWAP distance: {distance_pct:.2f}%\n"
-        f"Waiting for next candle OPEN."
-    )
+    # Avoid accidental 2x/3x contract exposure when multiple threshold variants
+    # qualify on the same candle. Parallel variants can be explicitly enabled.
+    selected_thresholds = sorted(eligible_thresholds) if PARALLEL_THRESHOLD_TRADES else [max(eligible_thresholds)]
+    for threshold in selected_thresholds:
+        threshold_pct = threshold * 100.0
+        duplicate = any(pd.Timestamp(p["signal_time"]) == signal_time and abs(float(p.get("threshold", threshold)) - threshold) < 1e-9 for p in pending_entries[ticker])
+        if duplicate:
+            continue
+        pending = {"signal_time": signal_time, "signal_close": close, "signal_vwap": vwap,
+                   "signal_ema9": ema, "distance_pct": distance_pct,
+                   "atr14": float(atr) if atr is not None and pd.notna(atr) else None,
+                   "threshold": threshold}
+        pending_entries[ticker].append(pending)
+        persist_pending_signal(ticker, pending)
+        print(f"V3 SIGNAL {ticker} threshold={threshold_pct:.2f}% time={signal_time} close={close:.4f} VWAP={vwap:.4f} EMA9(open)={ema:.4f} ATR14={atr}")
+        notify(f"📡 V3 GIVEBACK SIGNAL\n{ticker} | threshold {threshold_pct:.2f}%\nSignal: {signal_time.strftime('%H:%M')} ET\nClose: ${close:.2f} | VWAP: ${vwap:.2f}\nEMA9(open): ${ema:.2f} | ATR14: {float(atr):.4f}")
+    # The first next-minute trade can arrive before the completed-bar callback queues this signal.
+    next_minute = signal_time + pd.Timedelta(minutes=1)
+    cached_open = first_trade_by_minute[ticker].get(next_minute)
+    if cached_open is not None:
+        execute_pending_open(ticker, next_minute, cached_open)
 
 
 # ============================================================
 # NEXT CANDLE OPEN
 # ============================================================
 
-def execute_pending_open(
-    ticker,
-    timestamp,
-    open_price,
-):
-
-    if not pending_entries[
-        ticker
-    ]:
+def execute_pending_open(ticker, timestamp, open_price):
+    if not pending_entries[ticker]:
         return
-
-    bucket = pd.Timestamp(
-        timestamp
-    ).floor(
-        "5min"
-    )
-
-    if (
-        last_processed_open_bucket[
-            ticker
-        ]
-        == bucket
-    ):
+    minute = pd.Timestamp(timestamp)
+    if last_processed_open_minute[ticker] == minute:
         return
-
-    matching = [
-        p
-        for p in pending_entries[
-            ticker
-        ]
-        if pd.Timestamp(
-            p["signal_time"]
-        ).floor(
-            "5min"
-        ) < bucket
-    ]
-
-    if not matching:
+    matching = [p for p in pending_entries[ticker] if pd.Timestamp(p["signal_time"]) < minute and minute - pd.Timestamp(p["signal_time"]) == pd.Timedelta(minutes=1)]
+    stale = [p for p in pending_entries[ticker] if minute - pd.Timestamp(p["signal_time"]) > pd.Timedelta(minutes=1)]
+    for pending in stale:
+        remove_pending_signal(ticker, pending["signal_time"], pending.get("threshold"))
+    if not matching and not stale:
         return
-
-    last_processed_open_bucket[
-        ticker
-    ] = bucket
-
-    remaining = []
-
+    last_processed_open_minute[ticker] = minute
+    remaining = [p for p in pending_entries[ticker] if p not in matching and p not in stale]
+    pending_entries[ticker] = remaining
     for pending in matching:
-
-        signal_ema9 = float(
-            pending["signal_ema9"]
-        )
-
-        # EXACT RULE:
-        #
-        # Next candle OPEN must be
-        # above signal candle EMA9.
-
-        if (
-            float(open_price)
-            <= signal_ema9
-        ):
-
-            print(
-                f"{ticker}: LONG rejected "
-                f"at next open."
-            )
-
-            notify(
-                f"⛔ {ticker} LONG rejected\n"
-                f"Next open: "
-                f"${float(open_price):.2f}\n"
-                f"Signal EMA9: "
-                f"${signal_ema9:.2f}"
-            )
-            remove_pending_signal(ticker, pending["signal_time"])
-
+        remove_pending_signal(ticker, pending["signal_time"], pending.get("threshold"))
+        if float(open_price) <= float(pending["signal_ema9"]):
+            print(f"{ticker}: V3 entry rejected; next 1m open {open_price:.4f} <= signal EMA9 {pending['signal_ema9']:.4f}")
             continue
-
         execute_option_entry(
-            ticker=ticker,
-            signal_time=pd.Timestamp(
-                pending["signal_time"]
-            ),
-            entry_time=bucket,
-            underlying_open=float(
-                open_price
-            ),
-            signal_close=float(
-                pending["signal_close"]
-            ),
-            signal_vwap=float(
-                pending["signal_vwap"]
-            ),
-            signal_ema9=signal_ema9,
-            distance_pct=float(
-                pending["distance_pct"]
-            ),
+            ticker=ticker, signal_time=pd.Timestamp(pending["signal_time"]), entry_time=minute,
+            underlying_open=float(open_price), signal_close=float(pending["signal_close"]),
+            signal_vwap=float(pending["signal_vwap"]), signal_ema9=float(pending["signal_ema9"]),
+            distance_pct=float(pending["distance_pct"]), atr14=pending.get("atr14"), threshold=pending.get("threshold"),
         )
-
-    # Pending signals only live for
-    # their immediate next candle.
-    for p in pending_entries[
-        ticker
-    ]:
-
-        if p not in matching:
-            remaining.append(p)
-
-    pending_entries[
-        ticker
-    ] = remaining
 
 
 # ============================================================
@@ -2259,312 +1880,81 @@ def execute_option_exit(
 # EMA9 EXIT
 # ============================================================
 
-def check_ema9_exits(
-    ticker,
-    candle,
-    strategy_df,
-):
-
-    if not active_entries[
-        ticker
-    ]:
+def check_v3_exits(ticker, candle, strategy_df):
+    """Manage each overlapping option entry independently from the underlying 1m bars."""
+    if not active_entries[ticker] or strategy_df.empty:
         return
-
-    current_time = pd.Timestamp(
-        candle["time"]
-    )
-
-    current_close = float(
-        candle["close"]
-    )
-
-    current_ema9 = float(
-        strategy_df.iloc[-1]["ema9"]
-    )
-
+    current_time = pd.Timestamp(candle["time"]); close = float(candle["close"]); high = float(candle["high"])
+    current = strategy_df.iloc[-1]; ema = float(current["ema9"]); atr = current.get("atr14")
+    eod = current_time.time() >= FINAL_CANDLE_TIME
     remaining = []
-
-    for entry in active_entries[
-        ticker
-    ]:
-
-        entry_time = pd.Timestamp(
-            entry["entry_time"]
-        )
-
-        # Never carry overnight.
-        if (
-            entry_time.date()
-            != current_time.date()
-        ):
-
-            remaining.append(
-                entry
-            )
+    for entry in list(active_entries[ticker]):
+        entry_time = pd.Timestamp(entry["entry_time"])
+        if entry_time.date() != current_time.date() or current_time < entry_time:
+            remaining.append(entry); continue
+        entry_price = entry.get("entry_underlying")
+        if entry_price is None:
+            # Imported legacy positions may lack the underlying entry price needed for
+            # EMA/ATR management; they must still be flattened at the session close.
+            if eod:
+                if not execute_option_exit(entry, current_time, close, "END_OF_DAY"):
+                    remaining.append(entry)
+            else:
+                remaining.append(entry)
             continue
-
-        # The entry candle cannot
-        # trigger its own exit.
-        if current_time <= entry_time:
-
-            remaining.append(
-                entry
-            )
-            continue
-
-        # LONG ONLY:
-        #
-        # Exit only when a completed
-        # candle CLOSES below EMA9.
-        #
-        # Wicks are ignored.
-
-        if (
-            current_close
-            < current_ema9
-        ):
-
-            print()
-            print(
-                "========================================"
-            )
-            print("EMA9 EXIT")
-            print(
-                "========================================"
-            )
-            print(
-                f"Ticker:       {ticker}"
-            )
-            print(
-                f"Option:       "
-                f"{entry['option_symbol']}"
-            )
-            print(
-                f"Close:        "
-                f"{current_close:.4f}"
-            )
-            print(
-                f"EMA9:         "
-                f"{current_ema9:.4f}"
-            )
-            print(
-                f"Exit time:    {current_time}"
-            )
-            print(
-                "========================================"
-            )
-
-            success = (
-                execute_option_exit(
-                    entry,
-                    current_time,
-                    current_close,
-                    "EMA9",
-                )
-            )
-
-            if not success:
-                remaining.append(
-                    entry
-                )
-
-        else:
-
-            remaining.append(
-                entry
-            )
-
-    active_entries[
-        ticker
-    ] = remaining
+        entry_price = float(entry_price)
+        peak = max(float(entry.get("peak_underlying") or entry_price), high)
+        entry["peak_underlying"] = peak
+        if entry.get("atr14") is None and atr is not None and pd.notna(atr):
+            entry["atr14"] = float(atr)
+        entry_atr = entry.get("atr14")
+        if entry_atr is not None and float(entry_atr) > 0 and peak >= entry_price + GIVEBACK_ACTIVATION_ATR * float(entry_atr):
+            entry["giveback_active"] = True
+        # Persist peak/activation so a restart doesn't reset an already-active trail.
+        if entry.get("db_id"):
+            try:
+                conn = sqlite3.connect(TRADE_DB_PATH)
+                conn.execute("UPDATE trades SET peak_underlying=?, giveback_active=?, atr14=? WHERE id=?",
+                             (peak, int(bool(entry.get("giveback_active"))), entry.get("atr14"), entry["db_id"]))
+                conn.commit(); conn.close()
+            except Exception as exc:
+                print(f"Could not persist giveback state for {ticker}: {exc}")
+        reason = None
+        if entry.get("giveback_active"):
+            denominator = peak - entry_price
+            if denominator > 0 and (peak - close) / denominator >= GIVEBACK_FRACTION:
+                reason = "GIVEBACK"
+        if reason is None and close < ema:
+            reason = "EMA9"
+        if reason is None and eod:
+            reason = "END_OF_DAY"
+        if reason is None:
+            remaining.append(entry); continue
+        if not execute_option_exit(entry, current_time, close, reason):
+            remaining.append(entry)
+    active_entries[ticker] = remaining
 
 
-# ============================================================
-# END OF DAY
-#
-# Final available regular-session 5-minute candle
-# is 15:55 -> closes around 16:00.
-# ============================================================
-
-def check_end_of_day(
-    ticker,
-    candle,
-):
-
-    current_time = pd.Timestamp(
-        candle["time"]
-    )
-
-    if (
-        current_time.time()
-        != FINAL_CANDLE_TIME
-    ):
+def process_completed_1m_candle(ticker, candle):
+    timestamp = pd.Timestamp(candle["time"])
+    if last_processed_1m[ticker] == timestamp:
         return
-
-    if (
-        last_eod_date[ticker]
-        == current_time.date()
-    ):
-        return
-
-    last_eod_date[
-        ticker
-    ] = current_time.date()
-
-    # No new entry may come from
-    # the final candle.
-    for pending in pending_entries[ticker]:
-        remove_pending_signal(ticker, pending["signal_time"])
-    pending_entries[ticker] = []
-
-    if not active_entries[
-        ticker
-    ]:
-        return
-
-    current_close = float(
-        candle["close"]
-    )
-
-    print()
-    print(
-        "========================================"
-    )
-    print("END OF DAY EXIT")
-    print(
-        "========================================"
-    )
-    print(
-        f"Ticker: {ticker}"
-    )
-    print(
-        f"Positions: "
-        f"{len(active_entries[ticker])}"
-    )
-    print(
-        f"Underlying close: "
-        f"{current_close:.4f}"
-    )
-    print(
-        "========================================"
-    )
-
-    remaining = []
-
-    for entry in list(
-        active_entries[ticker]
-    ):
-
-        success = (
-            execute_option_exit(
-                entry,
-                current_time,
-                current_close,
-                "END_OF_DAY",
-            )
-        )
-
-        if not success:
-            remaining.append(
-                entry
-            )
-
-    active_entries[
-        ticker
-    ] = remaining
-
-
-# ============================================================
-# COMPLETED 5-MINUTE CANDLE
-# ============================================================
-
-def process_completed_5m_candle(
-    ticker,
-    candle,
-):
-
-    timestamp = pd.Timestamp(
-        candle["time"]
-    )
-
-    if (
-        last_processed_5m[ticker]
-        == timestamp
-    ):
-        return
-
-    last_processed_5m[
-        ticker
-    ] = timestamp
-
-    five_minute_history[
-        ticker
-    ].append(
-        candle
-    )
-
-    five_minute_history[
-        ticker
-    ] = (
-        five_minute_history[
-            ticker
-        ][-500:]
-    )
-
-    strategy_df = (
-        build_strategy_df(
-            ticker
-        )
-    )
-
+    last_processed_1m[ticker] = timestamp
+    one_minute_history[ticker].append(candle)
+    one_minute_history[ticker] = one_minute_history[ticker][-1000:]
+    strategy_df = build_strategy_df(ticker)
     if strategy_df.empty:
         return
-
-    # --------------------------------------------------------
-    # EXIT FIRST
-    # --------------------------------------------------------
-
-    check_ema9_exits(
-        ticker,
-        candle,
-        strategy_df,
-    )
-
-    # --------------------------------------------------------
-    # EOD
-    # --------------------------------------------------------
-
-    check_end_of_day(
-        ticker,
-        candle,
-    )
-
-    # --------------------------------------------------------
-    # NEVER ENTER ON FINAL CANDLE
-    # --------------------------------------------------------
-
-    if (
-        timestamp.time()
-        >= FINAL_CANDLE_TIME
-    ):
+    check_v3_exits(ticker, candle, strategy_df)
+    if timestamp.time() >= FINAL_CANDLE_TIME:
+        last_eod_date[ticker] = timestamp.date()
+        for pending in list(pending_entries[ticker]):
+            remove_pending_signal(ticker, pending["signal_time"])
+        pending_entries[ticker] = []
         return
-
     if len(strategy_df) < 2:
         return
-
-    previous = (
-        strategy_df.iloc[-2]
-    )
-
-    signal = (
-        strategy_df.iloc[-1]
-    )
-
-    queue_valid_signal(
-        ticker,
-        previous,
-        signal,
-    )
+    queue_valid_signal(ticker, strategy_df.iloc[-2], strategy_df.iloc[-1])
 
 
 # ============================================================
@@ -2572,158 +1962,42 @@ def process_completed_5m_candle(
 # ============================================================
 
 async def handle_bar(bar):
-
     ticker = bar.symbol
-
     if ticker not in one_minute_history:
         return
-
-    timestamp = ny_time(
-        bar.timestamp
-    )
-
-    if not is_regular_session_time(
-        timestamp
-    ):
+    timestamp = ny_time(bar.timestamp)
+    if not is_regular_session_time(timestamp):
         return
-
-    record = {
-        "ticker": ticker,
-        "time": timestamp,
-        "open": float(bar.open),
-        "high": float(bar.high),
-        "low": float(bar.low),
-        "close": float(bar.close),
-        "volume": float(bar.volume),
-    }
-
-    one_minute_history[
-        ticker
-    ].append(
-        record
-    )
-
-    # Keep enough recent bars
-    # to construct one 5-minute candle.
-    one_minute_history[
-        ticker
-    ] = (
-        one_minute_history[
-            ticker
-        ][-10:]
-    )
-
-    # Only process the completed
-    # 5-minute candle at :04, :09,
-    # :14, :19, etc.
-    if (
-        timestamp.minute % 5
-        != 4
-    ):
+    record = {"ticker": ticker, "time": timestamp, "open": float(bar.open), "high": float(bar.high),
+              "low": float(bar.low), "close": float(bar.close), "volume": float(bar.volume),
+              "vwap": float(getattr(bar, "vwap", 0) or 0)}
+    # Entry timing is handled by the live trade stream at the first trade of the next minute.
+    # Keep a complete intraday session to calculate indicators without losing session VWAP/EMA.
+    existing = one_minute_history[ticker]
+    if existing and pd.Timestamp(existing[-1]["time"]) == timestamp:
+        existing[-1] = record
         return
-
-    bucket = timestamp.floor(
-        "5min"
-    )
-
-    bars = [
-        x
-        for x in one_minute_history[
-            ticker
-        ]
-        if pd.Timestamp(
-            x["time"]
-        ).floor("5min")
-        == bucket
-    ]
-
-    if len(bars) < 5:
-        return
-
-    bars = sorted(
-        bars,
-        key=lambda x: x["time"]
-    )
-
-    candle = {
-        "ticker": ticker,
-        "time": bucket,
-        "open": float(
-            bars[0]["open"]
-        ),
-        "high": max(
-            float(x["high"])
-            for x in bars
-        ),
-        "low": min(
-            float(x["low"])
-            for x in bars
-        ),
-        "close": float(
-            bars[-1]["close"]
-        ),
-        "volume": sum(
-            float(x["volume"])
-            for x in bars
-        ),
-    }
-
-    process_completed_5m_candle(
-        ticker,
-        candle,
-    )
+    process_completed_1m_candle(ticker, record)
+    refresh_telegram_five_minute_history(ticker)
 
 
-# ============================================================
-# TRADE HANDLER
-#
-# Used to capture the first trade observed in
-# the NEXT 5-minute bucket.
-#
-# That is the price used for the strategy's
-# next-candle OPEN check.
-# ============================================================
-
-async def handle_trade(
-    trade
-):
-
-    ticker = trade.symbol
-
+async def handle_trade(trade):
+    ticker = getattr(trade, "symbol", None)
     if ticker not in pending_entries:
         return
-
-    if not pending_entries[
-        ticker
-    ]:
+    timestamp = ny_time(trade.timestamp)
+    if not is_regular_session_time(timestamp):
         return
-
-    timestamp = ny_time(
-        trade.timestamp
-    )
-
-    if not is_regular_session_time(
-        timestamp
-    ):
-        return
-
-    bucket = timestamp.floor(
-        "5min"
-    )
-
-    if (
-        last_processed_open_bucket[
-            ticker
-        ]
-        == bucket
-    ):
-        return
-
-    execute_pending_open(
-        ticker,
-        timestamp,
-        float(trade.price),
-    )
+    minute = timestamp.floor("min")
+    # Store only the first observed trade in each minute; this is the earliest live proxy
+    # for the next candle open and prevents the completed bar from causing a late entry.
+    bucket_map = first_trade_by_minute[ticker]
+    if minute not in bucket_map:
+        bucket_map[minute] = float(trade.price)
+    # Keep memory bounded to the latest 10 minute buckets per ticker.
+    for old_minute in sorted(bucket_map)[:-10]:
+        bucket_map.pop(old_minute, None)
+    execute_pending_open(ticker, minute, bucket_map[minute])
 
 
 # ============================================================
@@ -2744,8 +2018,8 @@ def notify_startup():
         "Direction: LONG ONLY\n"
         "Option: CALL ONLY\n"
         f"Contracts: {CONTRACTS}\n"
-        "Timeframe: 5m\n"
-        "Start: 10:00 NY\n"
+        "Strategy: V3 Giveback, 1m\n"
+        f"Data feed: Alpaca {DATA_FEED_NAME.upper()}\n"
         "Orders: "
         + (
             "ENABLED"
@@ -2820,15 +2094,7 @@ async def main():
 
         if not raw.empty:
 
-            five = (
-                prepare_strategy_data(
-                    raw
-                )
-            )
-
-            seed_history(
-                five
-            )
+            seed_history(raw)
 
             print(
                 "Strategy history seeded."
@@ -2838,8 +2104,8 @@ async def main():
 
                 print(
                     f"{ticker:5s}: "
-                    f"{len(five_minute_history[ticker])} "
-                    f"5m candles"
+                    f"{len(one_minute_history[ticker])} "
+                    f"1m bars"
                 )
 
     except Exception as exc:
@@ -2893,33 +2159,26 @@ async def main():
             print(exc)
 
     # --------------------------------------------------------
-    # CONTINUOUS POSITION RECONCILIATION
-    # --------------------------------------------------------
-
-    asyncio.create_task(reconciliation_loop())
-    print("Alpaca position reconciliation loop started (30s).")
-
-    # --------------------------------------------------------
     # LIVE STREAM
     # --------------------------------------------------------
 
     stream = StockDataStream(
         API_KEY,
         API_SECRET,
-        feed=DataFeed.IEX,
+        feed=DATA_FEED,
     )
 
-    for ticker in TICKERS:
+    for ticker in MANAGED_TICKERS:
 
         stream.subscribe_bars(
             handle_bar,
             ticker,
         )
-
         stream.subscribe_trades(
             handle_trade,
             ticker,
         )
+
 
     notify_startup()
 
@@ -2928,7 +2187,7 @@ async def main():
         "========================================"
     )
     print(
-        "LIVE 5-MINUTE IEX STREAM STARTED"
+        f"LIVE 1-MINUTE ALPACA {DATA_FEED_NAME.upper()} STREAM STARTED"
     )
     print(
         "========================================"
@@ -2943,25 +2202,24 @@ async def main():
         f"Contracts: {CONTRACTS}"
     )
     print(
-        "Start: 10:00 NY"
+        "Strategy: V3 Giveback; ticker-specific windows"
     )
-    print(
-        "VWAP distance: 0.28%"
-    )
+    print("VWAP thresholds: ticker-specific 0.30% / 0.35% / 0.40%")
+    print(f"Parallel threshold trades: {'ENABLED' if PARALLEL_THRESHOLD_TRADES else 'DISABLED (one order per signal candle)'}")
     print(
         "EMA9: OPEN source"
     )
     print(
-        "VWAP: OPEN source"
+        "VWAP: session-anchored typical price × volume (matches V3 backtest notebook)"
     )
     print(
-        "Entry: NEXT 5m OPEN"
+        "Entry: NEXT 1m OPEN, only if above signal EMA9"
     )
     print(
-        "Exit: CLOSE below EMA9"
+        "Exits: ATR14 giveback (1.5x ATR activation, 35% giveback), EMA9, EOD"
     )
     print(
-        "EOD: 15:55 candle"
+        "EOD: 15:59 one-minute candle (regular session close)"
     )
     print(
         "Overnight: DISABLED"
