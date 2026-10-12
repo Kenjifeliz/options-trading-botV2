@@ -186,9 +186,15 @@ print("Timeframe:       1 minute (V3 Giveback)")
 print("Entry windows:   ticker-specific V3 config")
 print(f"Data feed:       Alpaca {DATA_FEED_NAME.upper()}")
 print(f"Contracts:       {CONTRACTS}")
+configured_thresholds = sorted({
+    threshold
+    for ticker in TICKERS
+    for threshold in ticker_config(ticker)["thresholds"]
+})
 print(
-    f"VWAP filter:     "
-    f"{VWAP_DISTANCE_THRESHOLD:.2f}%"
+    "VWAP thresholds: "
+    + ", ".join(f"{threshold * 100:.2f}%" for threshold in configured_thresholds)
+    + " (ticker-specific)"
 )
 print(
     f"Orders:          "
