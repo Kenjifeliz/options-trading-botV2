@@ -1,8 +1,10 @@
 import os
 import json
 import asyncio
+import functools
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -16,27 +18,20 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 TIMEZONE = ZoneInfo("America/New_York")
 
-TICKERS = [
-    "AAPL",
-    "AMD",
-    "ASTS",
-    "BE",
-    "GOOG",
-    "HIMS",
-    "INTC",
-    "IREN",
-    "JPM",
-    "MRVL",
-    "NBIS",
-    "NVDA",
-    "ORCL",
-    "PLTR",
-    "QQQ",
-    "RKLB",
-    "SPCX",
-    "SPY",
-    "TSLA",
+# main.py passes its own live universe in state["tickers"]. This list is only a fallback so the
+# commands still work if that key is missing; it matches the V3 active universe (51 tickers).
+FALLBACK_TICKERS = [
+    "AAL", "AAPL", "AMD", "AMZN", "ASTS", "AUR", "BABA", "BAC",
+    "BE", "CCL", "COIN", "CSCO", "ET", "F", "GME", "GOOG",
+    "GOOGL", "GRAB", "HIMS", "HOOD", "HPE", "INTC", "IREN", "JD",
+    "JPM", "LI", "MARA", "META", "MRVL", "MSFT", "MSTR", "MU",
+    "NBIS", "NIO", "NOK", "NVDA", "ORCL", "PFE", "PLTR", "QQQ",
+    "SNAP", "SOFI", "SOUN", "SPCX", "SPY", "T", "TSLA", "TSM",
+    "UAL", "VALE", "XPEV",
 ]
+
+# Telegram rejects messages over 4096 characters; stay below that.
+MAX_MESSAGE_CHARS = 3900
 
 ALPACA_PAPER = (
     os.environ.get("ALPACA_PAPER", "true").lower() == "true"
@@ -46,6 +41,22 @@ ALPACA_API_KEY = os.environ.get("APCA_API_KEY_ID", "")
 ALPACA_SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY", "")
 
 _trading_client = None
+
+# Telegram I/O (long polling, sends, Alpaca account lookups for commands) runs on its own small
+# thread pool so it never competes with the bot's Alpaca REST work or blocks the event loop.
+_telegram_executor = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="telegram-io",
+)
+
+
+async def _run_blocking(function, *args):
+    loop = asyncio.get_running_loop()
+
+    return await loop.run_in_executor(
+        _telegram_executor,
+        functools.partial(function, *args),
+    )
 
 
 # ============================================================
@@ -128,28 +139,83 @@ def telegram_request(method, data=None):
     except Exception as error:
 
         print(
-            f"Telegram API error: {error}",
+            f"Telegram API error ({method}): {error}",
             flush=True,
         )
+
+        if "409" in str(error):
+            print(
+                "Telegram 409 Conflict: another process is polling this bot token "
+                "(an old Railway deployment or a copy running elsewhere). "
+                "Stop the other instance.",
+                flush=True,
+            )
 
         return None
 
 
+def split_message(text, limit=MAX_MESSAGE_CHARS):
+    """Split long text on line boundaries so every part fits Telegram's size limit."""
+
+    text = str(text)
+
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    for line in text.split("\n"):
+
+        while len(line) > limit:
+
+            if current:
+                chunks.append(current)
+                current = ""
+
+            chunks.append(line[:limit])
+            line = line[limit:]
+
+        candidate = line if not current else current + "\n" + line
+
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
 def send_message(text):
+    """Send text to the configured chat (long text is split). Returns True if every part was sent."""
 
     if not TELEGRAM_BOT_TOKEN:
-        return
+        return False
 
     if not TELEGRAM_CHAT_ID:
-        return
+        return False
 
-    telegram_request(
-        "sendMessage",
-        {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": str(text),
-        },
-    )
+    delivered = True
+
+    for chunk in split_message(text):
+
+        result = telegram_request(
+            "sendMessage",
+            {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+            },
+        )
+
+        if not result or not result.get("ok"):
+            delivered = False
+
+    return delivered
 
 
 # ============================================================
@@ -165,16 +231,16 @@ def format_number(value, decimals=2):
         return "N/A"
 
 
-def format_pct(value):
+def format_pct(value, decimals=2):
 
     try:
 
         value = float(value)
 
         if value >= 0:
-            return f"+{value:.2f}%"
+            return f"+{value:.{decimals}f}%"
 
-        return f"{value:.2f}%"
+        return f"{value:.{decimals}f}%"
 
     except Exception:
         return "N/A"
@@ -193,6 +259,30 @@ def format_money(value):
 
     except Exception:
         return "N/A"
+
+
+def format_duration(seconds):
+
+    try:
+        seconds = int(seconds)
+
+    except Exception:
+        return "N/A"
+
+    if seconds < 90:
+        return f"{seconds}s"
+
+    minutes = seconds // 60
+
+    if minutes < 90:
+        return f"{minutes}m"
+
+    hours, minutes = divmod(minutes, 60)
+
+    if hours < 48:
+        return f"{hours}h {minutes}m"
+
+    return f"{hours // 24}d {hours % 24}h"
 
 
 def parse_datetime(value):
@@ -217,48 +307,134 @@ def parse_datetime(value):
         return None
 
 
+def time_text(value):
+
+    dt = parse_datetime(value)
+
+    if dt is None:
+        return "N/A"
+
+    return dt.strftime("%H:%M:%S ET")
+
+
+def get_tickers(state):
+
+    tickers = state.get("tickers")
+
+    if tickers:
+        return list(tickers)
+
+    return list(FALLBACK_TICKERS)
+
+
+def get_strategy(state):
+
+    strategy = state.get("strategy")
+
+    if isinstance(strategy, dict):
+        return strategy
+
+    return {}
+
+
+def get_runtime(state):
+
+    runtime = state.get("runtime")
+
+    try:
+
+        if callable(runtime):
+            return runtime()
+
+        if isinstance(runtime, dict):
+            return runtime
+
+    except Exception as error:
+        print(
+            f"Telegram runtime snapshot error: {error}",
+            flush=True,
+        )
+
+    return {}
+
+
 def get_active_entries(state):
 
-    return state.get(
+    active = state.get(
         "active_entries",
         {},
     )
 
+    return {
+        ticker: list(entries or [])
+        for ticker, entries in list(active.items())
+    }
+
 
 def get_all_trades(state):
 
-    return state.get(
-        "all_trades",
-        [],
+    return list(
+        state.get(
+            "all_trades",
+            [],
+        )
     )
 
 
-def get_history(state):
+def get_latest(state):
 
-    return state.get(
-        "five_minute_history",
-        {},
+    return dict(
+        state.get(
+            "latest_indicators",
+            {},
+        )
     )
 
 
 def count_active_positions(state):
 
-    active = get_active_entries(state)
+    return sum(
+        len(entries)
+        for entries in get_active_entries(state).values()
+    )
 
-    total = 0
 
-    for entries in active.values():
+def get_trade_status(trade):
+    """CLOSED as soon as an exit time exists, whatever stale status text the record still carries."""
 
-        try:
-            total += len(entries)
+    if parse_datetime(trade.get("exit_time")) is not None:
+        return "CLOSED"
 
-        except Exception:
-            pass
+    status = trade.get("status")
 
-    return total
+    if status:
+        return str(status).upper()
+
+    return "OPEN"
+
+
+def get_trade_pnl_dollars(trade):
+
+    value = trade.get("pnl")
+
+    if value is None:
+        return None
+
+    try:
+
+        value = float(value)
+
+    except Exception:
+        return None
+
+    if value != value:
+        return None
+
+    return value
 
 
 def get_today_trades(state):
+    """Trades entered today or closed today."""
 
     today = datetime.now(
         TIMEZONE
@@ -272,59 +448,108 @@ def get_today_trades(state):
             trade.get("entry_time")
         )
 
-        if entry_time is None:
-            continue
+        exit_time = parse_datetime(
+            trade.get("exit_time")
+        )
 
-        if entry_time.date() == today:
+        entered_today = (
+            entry_time is not None
+            and entry_time.date() == today
+        )
+
+        closed_today = (
+            exit_time is not None
+            and exit_time.date() == today
+        )
+
+        if entered_today or closed_today:
             result.append(trade)
 
     return result
 
 
-def get_trade_pnl_dollars(trade):
+def realized_today(state):
+    """Closed trades whose exit happened today: (count, wins, losses, pnl_total)."""
 
-    value = trade.get("pnl")
+    today = datetime.now(
+        TIMEZONE
+    ).date()
 
-    if value is None:
+    count = 0
+    wins = 0
+    losses = 0
+    total = 0.0
+
+    for trade in get_all_trades(state):
+
+        exit_time = parse_datetime(
+            trade.get("exit_time")
+        )
+
+        if exit_time is None or exit_time.date() != today:
+            continue
+
+        pnl = get_trade_pnl_dollars(
+            trade
+        )
+
+        count += 1
+
+        if pnl is None:
+            continue
+
+        total += pnl
+
+        if pnl > 0:
+            wins += 1
+
+        elif pnl < 0:
+            losses += 1
+
+    return count, wins, losses, total
+
+
+def get_equity():
+
+    client = get_trading_client()
+
+    if client is None:
         return None
 
     try:
-        return float(value)
+
+        return client.get_account().equity
 
     except Exception:
         return None
 
 
-def get_trade_status(trade):
+def clock_time(text):
 
-    status = trade.get("status")
-
-    if status:
-        return str(status).upper()
-
-    if trade.get("exit_time") is not None:
-        return "CLOSED"
-
-    return "OPEN"
+    return datetime.strptime(
+        text,
+        "%H:%M",
+    ).time()
 
 
 # ============================================================
 # /HELP
 # ============================================================
 
-def build_help():
+def build_help(state=None, args=None):
 
     return (
         "🤖 BOT COMMANDS\n\n"
 
         "/start — Bot status, mode & portfolio size\n"
-        "/status — Full bot connection & operating status\n"
-        "/positions — Current open positions\n"
+        "/status — Connection, data flow & runtime health\n"
+        "/positions — Open option positions (giveback state)\n"
         "/trades — Today's trades\n"
-        "/p&l — Today's option P&L\n"
-        "/signals — Recent recorded entries/signals\n"
-        "/summary — Full daily overview\n"
-        "/now — Current 5-minute market conditions\n"
+        "/p&l — Today's realized option P&L\n"
+        "/signals — Today's entries + pending signals\n"
+        "/summary — Daily overview + V3 strategy rules\n"
+        "/now — Live 1-minute indicators (/now AAPL for one)\n"
+        "/tickers — The V3 universe, windows & thresholds\n"
         "/overall — Weekly, monthly & yearly performance\n"
         "/help — Show this command list"
     )
@@ -334,7 +559,7 @@ def build_help():
 # /START
 # ============================================================
 
-def start_message(state):
+def start_message(state, args=None):
 
     mode = (
         "PAPER"
@@ -342,26 +567,21 @@ def start_message(state):
         else "LIVE"
     )
 
-    equity = "N/A"
+    equity = format_number(
+        get_equity()
+    )
 
-    client = get_trading_client()
+    strategy = get_strategy(state)
 
-    if client is not None:
-
-        try:
-
-            account = client.get_account()
-
-            equity = format_number(
-                account.equity
-            )
-
-        except Exception:
-            pass
+    universe = strategy.get(
+        "universe_count",
+        len(get_tickers(state)),
+    )
 
     return (
         "🟢 BOT STATUS: ONLINE\n"
         f"MODE: {mode}\n"
+        f"STRATEGY: V3 Giveback, 1-minute, {universe} tickers\n"
         f"PORTFOLIO SIZE: ${equity}"
     )
 
@@ -370,20 +590,15 @@ def start_message(state):
 # /STATUS
 # ============================================================
 
-def status_message(state):
+def status_message(state, args=None):
+
+    runtime = get_runtime(state)
+    strategy = get_strategy(state)
 
     mode = (
         "PAPER"
         if ALPACA_PAPER
         else "LIVE"
-    )
-
-    active_count = count_active_positions(
-        state
-    )
-
-    today_trades = get_today_trades(
-        state
     )
 
     alpaca_status = "DISCONNECTED"
@@ -402,68 +617,138 @@ def status_message(state):
 
             alpaca_status = "DISCONNECTED"
 
-    history = get_history(state)
-
-    latest_time = None
-
-    for ticker in TICKERS:
-
-        candles = history.get(
-            ticker,
-            [],
-        )
-
-        if not candles:
-            continue
-
-        candle = candles[-1]
-
-        timestamp = (
-            candle.get("timestamp")
-            or candle.get("time")
-            or candle.get("datetime")
-        )
-
-        dt = parse_datetime(timestamp)
-
-        if dt is not None:
-
-            if (
-                latest_time is None
-                or dt > latest_time
-            ):
-                latest_time = dt
-
-    if latest_time is not None:
-
-        last_update = latest_time.strftime(
-            "%H:%M:%S ET"
-        )
-
-    else:
-
-        last_update = "N/A"
-
-    return (
-        "🟢 BOT STATUS: ONLINE\n\n"
-        f"Mode: {mode}\n"
-        "Market data: CONNECTED\n"
-        f"Alpaca: {alpaca_status}\n"
-        "Telegram: CONNECTED\n"
-        f"Last market update: {last_update}\n"
-        f"Active positions: {active_count}\n"
-        f"Trades today: {len(today_trades)}"
+    now = datetime.now(
+        TIMEZONE
     )
+
+    tickers = get_tickers(state)
+
+    lines = [
+        "🟢 BOT STATUS: ONLINE",
+        "",
+        f"Mode: {mode}",
+    ]
+
+    if "orders_enabled" in strategy:
+        lines.append(
+            "Orders: "
+            + (
+                "ENABLED"
+                if strategy["orders_enabled"]
+                else "DISABLED"
+            )
+        )
+
+    lines.append(
+        f"Data feed: Alpaca {strategy.get('feed', 'IEX')}"
+    )
+
+    lines.append(
+        f"Alpaca API: {alpaca_status}"
+    )
+
+    lines.append(
+        f"Strategy: V3 Giveback, 1-minute, "
+        f"{strategy.get('universe_count', len(tickers))} tickers"
+    )
+
+    lines.append(
+        f"Time: {now.strftime('%H:%M:%S ET')}"
+    )
+
+    if runtime:
+
+        market_open = runtime.get("market_open")
+
+        lines.append(
+            "Market: "
+            + (
+                "OPEN"
+                if market_open
+                else "CLOSED"
+            )
+        )
+
+        last_bar = runtime.get("last_bar_time")
+        age = runtime.get("last_bar_age_seconds")
+
+        if last_bar is not None and age is not None:
+
+            text = (
+                f"Last 1m bar: {last_bar.strftime('%H:%M')} ET "
+                f"({format_duration(age)} ago)"
+            )
+
+            if market_open and age > 180:
+                text += "  ⚠️ STALE"
+
+            lines.append(text)
+
+        else:
+
+            lines.append(
+                "Last 1m bar: none yet"
+            )
+
+        lines.append(
+            f"Tickers with data: "
+            f"{runtime.get('tickers_with_data', 0)}/{len(tickers)}"
+        )
+
+        lines.append(
+            f"Bars received: websocket {runtime.get('bars_stream', 0)}"
+            f" | REST gap-fill {runtime.get('bars_rest', 0)}"
+        )
+
+        lines.append(
+            f"Trade-channel subs: "
+            f"{runtime.get('trade_subscriptions', 0)}"
+            f"/{runtime.get('max_trade_subscriptions', 30)}"
+        )
+
+        lines.append(
+            f"Pending entries: {runtime.get('pending_signals', 0)}"
+        )
+
+        loop_age = runtime.get("loop_age_seconds")
+
+        if loop_age is not None:
+
+            lines.append(
+                f"Heartbeat: {format_duration(loop_age)} ago"
+            )
+
+        lines.append(
+            f"Uptime: {format_duration(runtime.get('uptime_seconds'))}"
+        )
+
+    lines.append(
+        f"Active positions: {count_active_positions(state)}"
+    )
+
+    lines.append(
+        f"Trades today: {len(get_today_trades(state))}"
+    )
+
+    return "\n".join(lines)
 
 
 # ============================================================
 # /POSITIONS
 # ============================================================
 
-def positions_message(state):
+def positions_message(state, args=None):
 
     active = get_active_entries(
         state
+    )
+
+    latest = get_latest(
+        state
+    )
+
+    universe = set(
+        get_tickers(state)
     )
 
     lines = [
@@ -473,79 +758,103 @@ def positions_message(state):
 
     total = 0
 
-    for ticker in TICKERS:
+    # Every ticker with an open entry is listed, including excluded tickers that still hold a
+    # position from an older bot version.
+    for ticker in sorted(active):
 
-        entries = active.get(
-            ticker,
-            [],
-        )
+        for entry in active[ticker]:
 
-        for entry in entries:
+            if entry.get("exit_time") is not None:
+                continue
 
             total += 1
 
-            option_symbol = entry.get(
-                "option_symbol",
-                "N/A",
+            label = (
+                f"🟢 {ticker} — CALL"
+                if ticker in universe
+                else f"🟡 {ticker} — CALL (legacy / excluded ticker)"
             )
 
-            contracts = entry.get(
-                "contracts",
-                0,
+            lines.append(label)
+
+            lines.append(
+                f"Option: {entry.get('option_symbol', 'N/A')}"
             )
 
-            entry_option = entry.get(
-                "entry_option"
+            lines.append(
+                f"Contracts: {entry.get('contracts', 0)}"
             )
 
             entry_underlying = entry.get(
                 "entry_underlying"
             )
 
-            entry_time = parse_datetime(
-                entry.get("entry_time")
-            )
-
-            lines.append(
-                f"🟢 {ticker} — CALL"
-            )
-
-            lines.append(
-                f"Option: {option_symbol}"
-            )
-
-            lines.append(
-                f"Contracts: {contracts}"
-            )
-
             if entry_underlying is not None:
 
-                lines.append(
+                text = (
                     "Underlying entry: $"
-                    + format_number(
-                        entry_underlying,
-                        2,
-                    )
+                    + format_number(entry_underlying, 2)
                 )
 
-            if entry_option is not None:
+                current = (latest.get(ticker) or {}).get("close")
+
+                try:
+
+                    if current:
+                        move = (
+                            float(current) / float(entry_underlying)
+                            - 1.0
+                        ) * 100.0
+
+                        text += (
+                            f" → ${format_number(current, 2)} "
+                            f"({format_pct(move)})"
+                        )
+
+                except Exception:
+                    pass
+
+                lines.append(text)
+
+            if entry.get("entry_option") is not None:
 
                 lines.append(
                     "Option entry: $"
-                    + format_number(
-                        entry_option,
-                        4,
-                    )
+                    + format_number(entry.get("entry_option"), 4)
                 )
 
-            if entry_time is not None:
+            peak = entry.get("peak_underlying")
+
+            if peak is not None and entry_underlying is not None:
+
+                armed = bool(entry.get("giveback_active"))
 
                 lines.append(
-                    "Entry: "
-                    + entry_time.strftime(
-                        "%H:%M:%S ET"
-                    )
+                    f"Peak: ${format_number(peak, 2)} | "
+                    f"Giveback: {'ARMED' if armed else 'not armed'}"
                 )
+
+            if entry.get("atr14") is not None:
+
+                lines.append(
+                    f"ATR14 at signal: {format_number(entry.get('atr14'), 4)}"
+                )
+
+            if entry.get("strategy_threshold") is not None:
+
+                try:
+
+                    lines.append(
+                        "Threshold: "
+                        + f"{float(entry['strategy_threshold']) * 100:.2f}%"
+                    )
+
+                except Exception:
+                    pass
+
+            lines.append(
+                "Entry: " + time_text(entry.get("entry_time"))
+            )
 
             lines.append(
                 "Status: OPEN"
@@ -570,16 +879,23 @@ def positions_message(state):
 # /TRADES
 # ============================================================
 
-def trades_message(state):
+def trades_message(state, args=None):
 
     trades = get_today_trades(
         state
     )
 
+    shown = trades[-40:]
+
     lines = [
         "📈 TODAY'S TRADES",
         "",
-        f"{len(trades)} trades",
+        f"{len(trades)} trades"
+        + (
+            f" (showing the last {len(shown)})"
+            if len(shown) < len(trades)
+            else ""
+        ),
         "",
     ]
 
@@ -587,31 +903,12 @@ def trades_message(state):
     losses = 0
     open_trades = 0
 
-    for index, trade in enumerate(
-        trades,
-        start=1,
-    ):
+    for trade in trades:
 
-        ticker = trade.get(
-            "ticker",
-            "?",
-        )
-
-        option_symbol = trade.get(
-            "option_symbol",
-            "",
-        )
-
-        pnl = get_trade_pnl_dollars(
-            trade
-        )
-
-        status = get_trade_status(
-            trade
-        )
+        status = get_trade_status(trade)
+        pnl = get_trade_pnl_dollars(trade)
 
         if status == "OPEN":
-
             open_trades += 1
 
         elif pnl is not None:
@@ -622,14 +919,26 @@ def trades_message(state):
             elif pnl < 0:
                 losses += 1
 
+    first_index = len(trades) - len(shown) + 1
+
+    for offset, trade in enumerate(shown):
+
+        status = get_trade_status(trade)
+        pnl = get_trade_pnl_dollars(trade)
+
         lines.append(
-            f"{index}. {ticker} — CALL"
+            f"{first_index + offset}. {trade.get('ticker', '?')} — CALL "
+            f"x{trade.get('contracts', '?')}"
         )
 
-        if option_symbol:
+        if trade.get("option_symbol"):
             lines.append(
-                f"   {option_symbol}"
+                f"   {trade.get('option_symbol')}"
             )
+
+        lines.append(
+            "   Entry: " + time_text(trade.get("entry_time"))
+        )
 
         if status == "OPEN":
 
@@ -637,29 +946,23 @@ def trades_message(state):
                 "   Status: OPEN"
             )
 
-        elif pnl is not None:
-
-            lines.append(
-                "   P&L: "
-                + format_money(pnl)
-            )
-
         else:
 
             lines.append(
-                f"   Status: {status}"
+                "   Exit: " + time_text(trade.get("exit_time"))
+                + (
+                    f" ({trade.get('exit_reason')})"
+                    if trade.get("exit_reason")
+                    else ""
+                )
             )
 
-        exit_time = parse_datetime(
-            trade.get("exit_time")
-        )
-
-        if exit_time is not None:
-
             lines.append(
-                "   Exit: "
-                + exit_time.strftime(
-                    "%H:%M:%S ET"
+                "   P&L: "
+                + (
+                    format_money(pnl)
+                    if pnl is not None
+                    else "N/A"
                 )
             )
 
@@ -680,59 +983,15 @@ def trades_message(state):
 # /P&L
 # ============================================================
 
-def pnl_message(state):
+def pnl_message(state, args=None):
 
-    trades = get_today_trades(
+    closed, wins, losses, realized = realized_today(
         state
     )
 
-    realized = 0.0
-    wins = 0
-    losses = 0
-    closed = 0
-
-    for trade in trades:
-
-        if get_trade_status(trade) == "OPEN":
-            continue
-
-        pnl = get_trade_pnl_dollars(
-            trade
-        )
-
-        if pnl is None:
-            continue
-
-        realized += pnl
-
-        closed += 1
-
-        if pnl > 0:
-            wins += 1
-
-        elif pnl < 0:
-            losses += 1
-
-    open_count = count_active_positions(
-        state
+    portfolio = format_number(
+        get_equity()
     )
-
-    portfolio = "N/A"
-
-    client = get_trading_client()
-
-    if client is not None:
-
-        try:
-
-            account = client.get_account()
-
-            portfolio = format_number(
-                account.equity
-            )
-
-        except Exception:
-            pass
 
     return (
         "💰 TODAY'S P&L\n\n"
@@ -741,7 +1000,7 @@ def pnl_message(state):
         f"Closed trades: {closed}\n"
         f"Wins: {wins}\n"
         f"Losses: {losses}\n"
-        f"Open positions: {open_count}\n\n"
+        f"Open positions: {count_active_positions(state)}\n\n"
         f"Portfolio: ${portfolio}"
     )
 
@@ -750,81 +1009,97 @@ def pnl_message(state):
 # /SIGNALS
 # ============================================================
 
-def signals_message(state):
+def signals_message(state, args=None):
 
-    trades = get_today_trades(
-        state
+    trades = [
+        trade
+        for trade in get_today_trades(state)
+        if trade.get("signal_time") is not None
+    ]
+
+    pending = state.get(
+        "pending_entries",
+        {},
     )
 
-    if not trades:
+    pending_rows = []
 
-        return (
-            "📡 RECENT SIGNALS\n\n"
-            "No entered signals recorded today.\n\n"
-            "Note: the current main.py does not "
-            "persist rejected signals separately."
-        )
+    for ticker, rows in list(pending.items()):
 
-    recent = trades[-10:]
+        for row in list(rows or []):
+            pending_rows.append((ticker, row))
 
     lines = [
-        "📡 RECENT SIGNALS / ENTRIES",
+        "📡 SIGNALS",
         "",
     ]
 
-    for trade in recent:
+    if pending_rows:
 
-        ticker = trade.get(
-            "ticker",
-            "?",
+        lines.append(
+            "Waiting for the next 1-minute open:"
         )
 
-        signal_time = parse_datetime(
-            trade.get("signal_time")
-        )
+        for ticker, row in pending_rows:
 
-        entry_time = parse_datetime(
-            trade.get("entry_time")
-        )
+            threshold = row.get("threshold")
 
-        if signal_time is not None:
-
-            signal_text = signal_time.strftime(
-                "%H:%M:%S ET"
+            lines.append(
+                f"• {ticker} | signal {time_text(row.get('signal_time'))}"
+                + (
+                    f" | threshold {float(threshold) * 100:.2f}%"
+                    if threshold is not None
+                    else ""
+                )
             )
 
-        else:
-
-            signal_text = "N/A"
-
-        if entry_time is not None:
-
-            entry_text = entry_time.strftime(
-                "%H:%M:%S ET"
+            lines.append(
+                f"  close ${format_number(row.get('signal_close'))} | "
+                f"VWAP ${format_number(row.get('signal_vwap'))} | "
+                f"EMA9(open) ${format_number(row.get('signal_ema9'))}"
             )
-
-        else:
-
-            entry_text = "N/A"
-
-        lines.append(
-            f"{ticker} — LONG CALL"
-        )
-
-        lines.append(
-            f"Signal: {signal_text}"
-        )
-
-        lines.append(
-            f"Entry: {entry_text}"
-        )
-
-        lines.append("Status: ENTERED")
 
         lines.append("")
 
+    if not trades:
+
+        lines.append(
+            "No entered signals recorded today."
+        )
+
+        lines.append(
+            "(Signals rejected by the next-open EMA9 check are written to the Railway log only.)"
+        )
+
+        return "\n".join(lines)
+
     lines.append(
-        f"Total shown: {len(recent)}"
+        "Entered today:"
+    )
+
+    for trade in trades[-10:]:
+
+        threshold = trade.get("strategy_threshold")
+
+        lines.append(
+            f"• {trade.get('ticker', '?')} — LONG CALL"
+            + (
+                f" | threshold {float(threshold) * 100:.2f}%"
+                if threshold is not None
+                else ""
+            )
+        )
+
+        lines.append(
+            f"  Signal: {time_text(trade.get('signal_time'))} | "
+            f"Entry: {time_text(trade.get('entry_time'))} | "
+            f"{get_trade_status(trade)}"
+        )
+
+    lines.append("")
+
+    lines.append(
+        f"Total shown: {min(len(trades), 10)} of {len(trades)}"
     )
 
     return "\n".join(lines)
@@ -834,41 +1109,75 @@ def signals_message(state):
 # /SUMMARY
 # ============================================================
 
-def summary_message(state):
+def describe_thresholds(values):
+
+    return " / ".join(
+        f"{float(value) * 100:.2f}%"
+        for value in values
+    )
+
+
+def strategy_text(state):
+
+    strategy = get_strategy(state)
+
+    if not strategy:
+
+        return (
+            "Strategy\n"
+            "• V3 Giveback, 1-minute candles\n"
+            "• (details unavailable: main.py did not pass its settings)"
+        )
+
+    windows = strategy.get("windows", {})
+
+    custom = [
+        ticker
+        for ticker, cfg in windows.items()
+        if cfg.get("source") == "custom"
+    ]
+
+    multi = (
+        "every qualifying threshold (parallel positions)"
+        if strategy.get("parallel_thresholds")
+        else "highest qualifying threshold only (one order per signal)"
+    )
+
+    return (
+        "Strategy: V3 Giveback (1-minute)\n"
+        f"• Universe: {strategy.get('universe_count')} tickers "
+        f"({len(custom)} custom windows), "
+        f"{len(strategy.get('removed', []))} excluded\n"
+        f"• Direction: LONG ONLY, CALL ONLY, "
+        f"{strategy.get('contracts')} contracts per trade\n"
+        f"• Standard window: {strategy.get('default_start')}–"
+        f"{strategy.get('default_end')} ET, thresholds "
+        f"{describe_thresholds(strategy.get('default_thresholds', []))}\n"
+        "• Signal: previous close ≤ VWAP, close > VWAP and "
+        "≥ VWAP×(1+threshold), close > EMA9 of OPEN prices\n"
+        "• Entry: next 1-minute open, only if above the signal EMA9\n"
+        f"• Several thresholds on one candle: {multi}\n"
+        f"• Exits: giveback (peak ≥ entry + {strategy.get('giveback_activation_atr')}×ATR"
+        f"{strategy.get('atr_length')}, then "
+        f"{float(strategy.get('giveback_fraction', 0)) * 100:.0f}% giveback), "
+        "close < EMA9, end of day\n"
+        f"• End of day: {strategy.get('eod_candle')} candle; open positions are sold "
+        f"{strategy.get('eod_flatten_seconds')}s before 16:00 ET\n"
+        f"• Feed: Alpaca {strategy.get('feed')} | "
+        f"Orders {'ENABLED' if strategy.get('orders_enabled') else 'DISABLED'} | "
+        f"{'PAPER' if strategy.get('paper') else 'LIVE'}"
+    )
+
+
+def summary_message(state, args=None):
 
     today_trades = get_today_trades(
         state
     )
 
-    active_count = count_active_positions(
+    closed, wins, losses, realized = realized_today(
         state
     )
-
-    closed_pnl = 0.0
-    wins = 0
-    losses = 0
-    closed = 0
-
-    for trade in today_trades:
-
-        if get_trade_status(trade) == "OPEN":
-            continue
-
-        pnl = get_trade_pnl_dollars(
-            trade
-        )
-
-        if pnl is None:
-            continue
-
-        closed += 1
-        closed_pnl += pnl
-
-        if pnl > 0:
-            wins += 1
-
-        elif pnl < 0:
-            losses += 1
 
     mode = (
         "PAPER"
@@ -885,95 +1194,243 @@ def summary_message(state):
 
         "Trading\n"
         f"• Trades today: {len(today_trades)}\n"
-        f"• Closed: {closed}\n"
+        f"• Closed today: {closed}\n"
         f"• Wins: {wins}\n"
         f"• Losses: {losses}\n"
-        f"• Open positions: {active_count}\n"
-        f"• Realized option P&L: "
-        f"{format_money(closed_pnl)}\n\n"
+        f"• Open positions: {count_active_positions(state)}\n"
+        f"• Realized option P&L: {format_money(realized)}\n\n"
 
-        "Strategy\n"
-        "• Direction: LONG ONLY\n"
-        "• Option: CALL ONLY\n"
-        "• Timeframe: 5 minutes\n"
-        "• Start: 10:00 ET\n"
-        "• VWAP filter: 0.28%\n"
-        "• Exit: CLOSE below EMA9\n"
-        "• EOD: Final session candle"
+        + strategy_text(state)
     )
+
+
+# ============================================================
+# /TICKERS
+# ============================================================
+
+def tickers_message(state, args=None):
+
+    tickers = sorted(
+        get_tickers(state)
+    )
+
+    strategy = get_strategy(state)
+    windows = strategy.get("windows", {})
+
+    lines = [
+        f"🎯 V3 UNIVERSE: {len(tickers)} tickers",
+        "",
+        ", ".join(tickers),
+        "",
+    ]
+
+    custom = sorted(
+        ticker
+        for ticker, cfg in windows.items()
+        if cfg.get("source") == "custom"
+    )
+
+    if custom:
+
+        lines.append(
+            "Custom windows (ET):"
+        )
+
+        for ticker in custom:
+
+            cfg = windows[ticker]
+
+            lines.append(
+                f"• {ticker}: {cfg['start']}–{cfg['end']} | "
+                f"{describe_thresholds(cfg['thresholds'])}"
+            )
+
+        lines.append("")
+
+    if strategy:
+
+        lines.append(
+            f"All other {len(tickers) - len(custom)} tickers: "
+            f"{strategy.get('default_start')}–{strategy.get('default_end')} | "
+            f"{describe_thresholds(strategy.get('default_thresholds', []))}"
+        )
+
+        lines.append("")
+
+        removed = strategy.get("removed", [])
+
+        if removed:
+
+            lines.append(
+                f"Excluded from new entries ({len(removed)}): "
+                + ", ".join(sorted(removed))
+            )
+
+    return "\n".join(lines)
 
 
 # ============================================================
 # /NOW
 # ============================================================
 
-def now_message(state):
+def in_window(ticker, windows, now):
 
-    history = get_history(
-        state
-    )
+    cfg = windows.get(ticker)
+
+    if not cfg:
+        return None
+
+    try:
+
+        return (
+            clock_time(cfg["start"])
+            <= now.time()
+            <= clock_time(cfg["end"])
+        )
+
+    except Exception:
+        return None
+
+
+def ticker_line(ticker, indicators, windows, now):
+
+    close = indicators.get("close")
+    vwap = indicators.get("session_vwap")
+    ema9 = indicators.get("ema9")
+    atr = indicators.get("atr14")
+
+    text = f"{ticker}: ${format_number(close, 2)}"
+
+    try:
+
+        if close and vwap:
+            text += f" | VWAP {format_pct((close / vwap - 1.0) * 100.0)}"
+
+        if close and ema9:
+            text += f" | EMA9 {format_pct((close / ema9 - 1.0) * 100.0)}"
+
+        if atr:
+            text += f" | ATR {format_number(atr, 3)}"
+
+    except Exception:
+        pass
+
+    flag = in_window(ticker, windows, now)
+
+    if flag is True:
+        text += " | ● in window"
+
+    elif flag is False:
+        text += " | ○ out of window"
+
+    return text
+
+
+def ticker_detail(ticker, state):
+
+    latest = get_latest(state)
+    strategy = get_strategy(state)
+    windows = strategy.get("windows", {})
+    now = datetime.now(TIMEZONE)
+
+    indicators = latest.get(ticker)
+
+    if not indicators:
+
+        return f"{ticker}: no 1-minute data yet."
 
     lines = [
-        "📡 CURRENT MARKET WATCH",
+        f"📡 {ticker} — 1-minute",
+        "",
+        ticker_line(ticker, indicators, windows, now),
+        f"Last completed bar: {indicators['time'].strftime('%H:%M')} ET",
+    ]
+
+    cfg = windows.get(ticker)
+
+    close = indicators.get("close")
+    vwap = indicators.get("session_vwap")
+
+    if cfg:
+
+        lines.append(
+            f"Entry window: {cfg['start']}–{cfg['end']} ET"
+        )
+
+        if vwap:
+
+            for threshold in cfg["thresholds"]:
+
+                lines.append(
+                    f"Needs close ≥ ${format_number(vwap * (1 + float(threshold)), 2)} "
+                    f"(VWAP +{float(threshold) * 100:.2f}%)"
+                )
+
+    ema9 = indicators.get("ema9")
+
+    if ema9 and close:
+
+        lines.append(
+            "Close is "
+            + ("above" if close > ema9 else "below")
+            + f" EMA9 (${format_number(ema9, 2)})"
+        )
+
+    return "\n".join(lines)
+
+
+def now_message(state, args=None):
+
+    if args:
+
+        return ticker_detail(
+            args[0].upper(),
+            state,
+        )
+
+    latest = get_latest(state)
+    strategy = get_strategy(state)
+    windows = strategy.get("windows", {})
+    now = datetime.now(TIMEZONE)
+
+    lines = [
+        "📡 CURRENT MARKET WATCH (1-minute)",
         "",
     ]
 
     found = 0
 
-    for ticker in TICKERS:
+    for ticker in sorted(get_tickers(state)):
 
-        candles = history.get(
-            ticker,
-            [],
-        )
+        indicators = latest.get(ticker)
 
-        if not candles:
+        if not indicators or indicators.get("close") is None:
             continue
 
-        candle = candles[-1]
-
-        close = candle.get(
-            "close"
+        lines.append(
+            ticker_line(ticker, indicators, windows, now)
         )
-
-        if close is None:
-            continue
-
-        vwap = candle.get(
-            "vwap"
-        )
-
-        ema9 = candle.get(
-            "ema9"
-        )
-
-        text = (
-            f"{ticker}: "
-            f"${format_number(close, 2)}"
-        )
-
-        if vwap is not None:
-
-            text += (
-                f" | VWAP "
-                f"${format_number(vwap, 2)}"
-            )
-
-        if ema9 is not None:
-
-            text += (
-                f" | EMA9 "
-                f"${format_number(ema9, 2)}"
-            )
-
-        lines.append(text)
 
         found += 1
 
     if found == 0:
 
         lines.append(
-            "No live 5-minute candles yet."
+            "No live 1-minute candles yet."
+        )
+
+    else:
+
+        newest = max(
+            indicators["time"]
+            for indicators in latest.values()
+            if indicators
+        )
+
+        lines.insert(
+            1,
+            f"{found} tickers | latest bar {newest.strftime('%H:%M')} ET | "
+            "● = inside entry window",
         )
 
     return "\n".join(lines)
@@ -983,7 +1440,7 @@ def now_message(state):
 # /OVERALL
 # ============================================================
 
-def overall_message(state):
+def overall_message(state, args=None):
 
     trades = get_all_trades(
         state
@@ -993,41 +1450,27 @@ def overall_message(state):
         TIMEZONE
     )
 
+    midnight = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
     period_starts = {
-        "TODAY": now.replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
+        "TODAY": midnight,
+
+        "THIS WEEK": midnight - timedelta(
+            days=now.weekday()
         ),
 
-        "THIS WEEK": (
-            now
-            - timedelta(
-                days=now.weekday()
-            )
-        ).replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
+        "THIS MONTH": midnight.replace(
+            day=1
         ),
 
-        "THIS MONTH": now.replace(
-            day=1,
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
-        ),
-
-        "THIS YEAR": now.replace(
+        "THIS YEAR": midnight.replace(
             month=1,
             day=1,
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
         ),
     }
 
@@ -1042,24 +1485,22 @@ def overall_message(state):
 
         for trade in trades:
 
-            entry_time = parse_datetime(
-                trade.get("entry_time")
+            if get_trade_status(trade) == "OPEN":
+                continue
+
+            # A closed trade counts in the period in which it was closed.
+            closed_at = (
+                parse_datetime(trade.get("exit_time"))
+                or parse_datetime(trade.get("entry_time"))
             )
 
-            if entry_time is None:
-                continue
-
-            if entry_time < start_date:
-                continue
-
-            if get_trade_status(trade) == "OPEN":
+            if closed_at is None or closed_at < start_date:
                 continue
 
             filtered.append(
                 trade
             )
 
-        total = len(filtered)
         wins = 0
         losses = 0
         breakeven = 0
@@ -1077,30 +1518,25 @@ def overall_message(state):
             total_pnl += pnl
 
             if pnl > 0:
-
                 wins += 1
 
             elif pnl < 0:
-
                 losses += 1
 
             else:
-
                 breakeven += 1
 
-        if total > 0:
+        decided = wins + losses + breakeven
 
-            win_rate = (
-                wins / total * 100
-            )
-
-        else:
-
-            win_rate = 0.0
+        win_rate = (
+            wins / decided * 100
+            if decided
+            else 0.0
+        )
 
         output.append(
             f"{name}\n"
-            f"Trades: {total}\n"
+            f"Trades: {len(filtered)}\n"
             f"Wins: {wins}\n"
             f"Losses: {losses}\n"
             f"Breakeven: {breakeven}\n"
@@ -1116,54 +1552,52 @@ def overall_message(state):
 # COMMAND HANDLER
 # ============================================================
 
+COMMANDS = {
+    "/start": start_message,
+    "/help": build_help,
+    "/status": status_message,
+    "/positions": positions_message,
+    "/trades": trades_message,
+    "/p&l": pnl_message,
+    "/pnl": pnl_message,
+    "/signals": signals_message,
+    "/summary": summary_message,
+    "/now": now_message,
+    "/tickers": tickers_message,
+    "/overall": overall_message,
+}
+
+
 async def handle_command(
     command,
     state,
 ):
+    """Run one command. `command` may include arguments (for example '/now AAPL').
 
-    command = (
-        command
-        .strip()
-        .split()[0]
-        .lower()
-    )
+    The builders do blocking work (Alpaca account lookups), so they run on the Telegram
+    thread pool and never block the bot's event loop."""
 
-    if command == "/start":
-        return start_message(state)
+    parts = str(command).strip().split()
 
-    if command == "/help":
-        return build_help()
+    if not parts:
+        return None
 
-    if command == "/status":
-        return status_message(state)
+    name = parts[0].split("@")[0].lower()
+    args = parts[1:]
 
-    if command == "/positions":
-        return positions_message(state)
+    builder = COMMANDS.get(name)
 
-    if command == "/trades":
-        return trades_message(state)
+    if builder is None:
 
-    if command in (
-        "/p&l",
-        "/pnl",
-    ):
-        return pnl_message(state)
+        return (
+            "Unknown command.\n\n"
+            + build_help()
+        )
 
-    if command == "/signals":
-        return signals_message(state)
-
-    if command == "/summary":
-        return summary_message(state)
-
-    if command == "/now":
-        return now_message(state)
-
-    if command == "/overall":
-        return overall_message(state)
-
-    return (
-        "Unknown command.\n\n"
-        + build_help()
+    return await _run_blocking(
+        builder,
+        state,
+        args,
     )
 
 
@@ -1217,7 +1651,7 @@ async def telegram_poll_loop(
     # Verify bot credentials
     # --------------------------------------------------------
 
-    me = await asyncio.to_thread(
+    me = await _run_blocking(
         telegram_request,
         "getMe",
     )
@@ -1248,7 +1682,7 @@ async def telegram_poll_loop(
 
     offset = 0
 
-    result = await asyncio.to_thread(
+    result = await _run_blocking(
         telegram_request,
         "getUpdates",
         {
@@ -1285,7 +1719,7 @@ async def telegram_poll_loop(
 
         try:
 
-            result = await asyncio.to_thread(
+            result = await _run_blocking(
                 telegram_request,
                 "getUpdates",
                 {
@@ -1352,9 +1786,12 @@ async def telegram_poll_loop(
                 ):
                     continue
 
-                text = message.get(
-                    "text",
-                    "",
+                text = (
+                    message.get(
+                        "text",
+                        "",
+                    )
+                    or ""
                 ).strip()
 
                 if not text:
@@ -1363,29 +1800,23 @@ async def telegram_poll_loop(
                 if not text.startswith("/"):
                     continue
 
-                command = (
-                    text
-                    .split()[0]
-                    .split("@")[0]
-                    .lower()
-                )
-
                 print(
-                    f"Telegram command received: {command}",
+                    f"Telegram command received: {text.split()[0].split('@')[0].lower()}",
                     flush=True,
                 )
 
                 try:
 
                     response = await handle_command(
-                        command,
+                        text,
                         state,
                     )
 
                     if response:
 
-                        send_message(
-                            response
+                        await _run_blocking(
+                            send_message,
+                            response,
                         )
 
                 except Exception as error:
@@ -1396,9 +1827,10 @@ async def telegram_poll_loop(
                         flush=True,
                     )
 
-                    send_message(
+                    await _run_blocking(
+                        send_message,
                         "⚠️ Telegram command error:\n"
-                        + str(error)
+                        + str(error),
                     )
 
         except asyncio.CancelledError:
