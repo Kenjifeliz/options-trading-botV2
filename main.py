@@ -1,15 +1,21 @@
 import os
 import re
+import time
 import asyncio
+import logging
 import sqlite3
+import functools
+import threading
+import traceback
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
 from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockTradesRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 from alpaca.data.live.stock import StockDataStream
@@ -37,6 +43,19 @@ try:
 except Exception:
     send_message = None
     telegram_poll_loop = None
+
+
+# Railway block-buffers stdout when it is not a terminal, so a frozen process can hide its last
+# log lines. Flush every print immediately.
+print = functools.partial(print, flush=True)
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+)
+# alpaca-py reports stream subscriptions and server errors (for example "symbol limit
+# exceeded") through logging; INFO makes those confirmations visible in the Railway logs.
+logging.getLogger("alpaca").setLevel(logging.INFO)
 
 
 # ============================================================
@@ -71,6 +90,22 @@ GIVEBACK_FRACTION = 0.35
 PARALLEL_THRESHOLD_TRADES = os.environ.get("V3_PARALLEL_THRESHOLD_TRADES", "false").lower() == "true"
 FINAL_CANDLE_TIME = datetime.strptime("15:59", "%H:%M").time()
 CONTRACTS = int(os.environ.get("CONTRACTS", "5"))
+
+# ------------------------------------------------------------
+# Execution-safety settings. None of these change the V3 signal or exit rules.
+# ------------------------------------------------------------
+# The strategy's end-of-day exit is the close of the 15:59 candle (= 16:00:00). Single-stock options
+# stop trading at 16:00 ET, so an order sent only after that candle completes can miss the market.
+# The bot therefore flattens open positions this many seconds before the close. 0 disables it.
+EOD_FLATTEN_SECONDS_BEFORE_CLOSE = int(os.environ.get("EOD_FLATTEN_SECONDS_BEFORE_CLOSE", "20"))
+# If the asyncio loop makes no progress for this long, alert on Telegram and exit so Railway restarts.
+WATCHDOG_STALL_SECONDS = int(os.environ.get("WATCHDOG_STALL_SECONDS", "300"))
+# How long to keep asking REST for the true first trade of the entry minute.
+ENTRY_OPEN_REST_TIMEOUT_SECONDS = int(os.environ.get("ENTRY_OPEN_REST_TIMEOUT_SECONDS", "20"))
+# Seconds after each minute boundary at which the REST gap-filler looks for missing bars.
+GAPFILL_DELAY_SECONDS = int(os.environ.get("GAPFILL_DELAY_SECONDS", "6"))
+# A position younger than this is never declared "closed outside the bot" by reconciliation.
+RECONCILE_GRACE_SECONDS = 120
 
 # Configured threshold variants run independently, as in the strategy register.
 # Threshold values are decimals (0.003 = 0.30%).
@@ -213,19 +248,30 @@ print()
 # TELEGRAM
 # ============================================================
 
+# Telegram sends run on ONE background thread. send_message() uses blocking HTTP with a long
+# timeout; calling it directly from the event loop would freeze market data whenever Telegram is slow.
+_notify_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="telegram-notify")
+
+
+def _deliver_notification(message):
+    try:
+        result = send_message(message)
+
+        if asyncio.iscoroutine(result):
+            asyncio.run(result)
+
+    except Exception as exc:
+        print(
+            f"Telegram notification failed: {exc}"
+        )
+
+
 def notify(message):
     if send_message is None:
         return
 
     try:
-        result = send_message(message)
-
-        if asyncio.iscoroutine(result):
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(result)
-            except Exception:
-                pass
+        _notify_executor.submit(_deliver_notification, message)
 
     except Exception as exc:
         print(
@@ -419,6 +465,9 @@ def save_trade_entry(entry):
 
 
 def save_trade_exit(entry):
+
+    # Keep the in-memory record consistent with the database (Telegram reads this status).
+    entry["status"] = "CLOSED"
 
     if not entry.get("db_id"):
         return
@@ -928,7 +977,17 @@ def mark_entry_external_close(entry, current_time, reason="MANUAL_CLOSE"):
     )
 
 
+def _entry_age_seconds(entry, now):
+    """Seconds since the entry was opened; very large if it cannot be determined."""
+    try:
+        return (pd.Timestamp(now) - pd.Timestamp(entry.get("entry_time"))).total_seconds()
+    except Exception:
+        return 10 ** 9
+
+
 def reconcile_alpaca_positions(notify_changes=True):
+    # Runs in a worker thread (see reconciliation_loop) while the event loop keeps adding and
+    # closing entries, so it works on a snapshot and merges concurrent changes back at the end.
     positions = _position_map()
     if positions is None:
         return False
@@ -937,16 +996,22 @@ def reconcile_alpaca_positions(notify_changes=True):
     changed = False
 
     for ticker in MANAGED_TICKERS:
-        entries = active_entries[ticker]
-        if not entries:
+        snapshot = list(active_entries[ticker])
+        if not snapshot:
             continue
 
         by_symbol = defaultdict(list)
-        for entry in entries:
+        for entry in snapshot:
             by_symbol[str(entry.get("option_symbol"))].append(entry)
 
         new_entries = []
         for symbol, symbol_entries in by_symbol.items():
+            # An entry filled seconds ago can be missing from a position list fetched just before
+            # the fill. Never treat a brand-new entry as "closed outside the bot".
+            if any(_entry_age_seconds(e, now) < RECONCILE_GRACE_SECONDS for e in symbol_entries):
+                new_entries.extend(symbol_entries)
+                continue
+
             actual_qty = int(positions.get(symbol, {}).get("qty", 0))
             expected_qty = sum(int(e.get("contracts") or 0) for e in symbol_entries)
 
@@ -981,7 +1046,30 @@ def reconcile_alpaca_positions(notify_changes=True):
                     mark_entry_external_close(entry, now, "MANUAL_CLOSE")
                     changed = True
 
-        active_entries[ticker] = new_entries
+        # Keep entries the event loop added while this pass ran, and drop any it closed meanwhile.
+        added = [e for e in active_entries[ticker] if not any(e is s for s in snapshot)]
+        active_entries[ticker] = [e for e in new_entries if e.get("exit_time") is None] + added
+
+    # Alert (once per contract) about call positions in the account that the bot does not track.
+    tracked = {
+        str(e.get("option_symbol"))
+        for entries in active_entries.values()
+        for e in entries
+    }
+    for symbol, info in positions.items():
+        if symbol in tracked or symbol in warned_unknown_positions:
+            continue
+        details = _option_details_from_symbol(symbol)
+        if details is None or details["option_type"] != "CALL" or int(info.get("qty") or 0) <= 0:
+            continue
+        warned_unknown_positions.add(symbol)
+        print(f"UNTRACKED POSITION in Alpaca: {symbol} qty={info.get('qty')}")
+        notify(
+            f"⚠️ UNTRACKED POSITION\n"
+            f"{symbol}\n"
+            f"Contracts held at Alpaca: {info.get('qty')}\n"
+            f"The bot has no open trade for it, so it will NOT manage or exit it."
+        )
 
     return changed
 
@@ -1013,14 +1101,57 @@ last_eod_date = {ticker: None for ticker in MANAGED_TICKERS}
 five_minute_history = {ticker: [] for ticker in MANAGED_TICKERS}
 first_trade_by_minute = {ticker: {} for ticker in MANAGED_TICKERS}
 
-# Alpaca Basic/IEX allows unlimited minute-bar subscriptions but only 30 trade/quote
-# symbols. Subscribe to trade channels only for tickers with pending next-minute entries.
+# Runtime bookkeeping used by Telegram /status, the heartbeat and the watchdog.
+latest_indicators = {}      # ticker -> indicators of the latest completed 1m candle (Telegram /now)
+rest_open_lookups = set()   # (ticker, minute) pairs with a REST entry-open lookup in flight
+background_tasks = set()    # strong references: asyncio keeps only weak references to tasks
+warned_unknown_positions = set()
+runtime_stats = {
+    "started": time.time(),
+    "loop_tick": time.time(),   # refreshed by heartbeat_loop(); the watchdog thread reads it
+    "bars_stream": 0,
+    "bars_rest": 0,
+}
+
+# Alpaca documents a 30-symbol websocket cap on the Basic plan. The docs do not say whether minute-bar
+# subscriptions count toward it, so the startup log prints what the server answers and
+# rest_bar_gapfill_loop() covers any bars the websocket fails to deliver. Trade channels are
+# subscribed only for tickers with pending next-minute entries.
 MAX_IEX_TRADE_SYMBOLS = 30
 trade_subscribed_tickers = set()
 market_data_stream = None
 
+# Subscribe/unsubscribe calls run on ONE worker thread, in order.
+#
+# alpaca-py's subscribe_trades()/unsubscribe_trades() block until the websocket loop has sent the
+# message (asyncio.run_coroutine_threadsafe(...).result()). Called from inside a stream handler -
+# which runs ON that loop - they wait for themselves and freeze the whole bot: market data,
+# Telegram replies and reconciliation all stop while the process stays alive. A worker thread
+# keeps the loop free.
+_stream_control_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-control")
+
+
+def _subscribe_trades_worker(ticker):
+    try:
+        market_data_stream.subscribe_trades(handle_trade, ticker)
+        print(f"IEX trade channel subscribed for pending entry: {ticker} ({len(trade_subscribed_tickers)}/{MAX_IEX_TRADE_SYMBOLS})")
+    except Exception as exc:
+        trade_subscribed_tickers.discard(ticker)
+        print(f"Could not subscribe to IEX trades for {ticker}: {exc}")
+        notify(f"⚠️ Could not subscribe to IEX trades for {ticker}: {exc}")
+
+
+def _unsubscribe_trades_worker(ticker):
+    try:
+        if market_data_stream is not None:
+            market_data_stream.unsubscribe_trades(ticker)
+        print(f"IEX trade channel released: {ticker} ({len(trade_subscribed_tickers)}/{MAX_IEX_TRADE_SYMBOLS})")
+    except Exception as exc:
+        print(f"Could not release IEX trade channel for {ticker}: {exc}")
+
+
 def ensure_trade_subscription(ticker):
-    """Subscribe to a ticker's trade channel while it has a pending entry."""
+    """Subscribe to a ticker's trade channel while it has a pending entry (never blocks the loop)."""
     if DATA_FEED_NAME != "iex" or ticker in trade_subscribed_tickers:
         return ticker in trade_subscribed_tickers
     if market_data_stream is None:
@@ -1029,28 +1160,18 @@ def ensure_trade_subscription(ticker):
         print(f"IEX trade subscription cap ({MAX_IEX_TRADE_SYMBOLS}) reached; cannot subscribe {ticker} for next-open validation.")
         notify(f"⚠️ IEX trade subscription cap reached; {ticker} entry timing may be missed.")
         return False
-    try:
-        market_data_stream.subscribe_trades(handle_trade, ticker)
-        trade_subscribed_tickers.add(ticker)
-        print(f"IEX trade channel subscribed for pending entry: {ticker} ({len(trade_subscribed_tickers)}/{MAX_IEX_TRADE_SYMBOLS})")
-        return True
-    except Exception as exc:
-        print(f"Could not subscribe to IEX trades for {ticker}: {exc}")
-        notify(f"⚠️ Could not subscribe to IEX trades for {ticker}: {exc}")
-        return False
+    trade_subscribed_tickers.add(ticker)  # reserve the slot now; rolled back if the worker fails
+    _stream_control_executor.submit(_subscribe_trades_worker, ticker)
+    return True
+
 
 def release_trade_subscription_if_idle(ticker):
-    """Release an IEX trade channel once no pending entries need it."""
+    """Release an IEX trade channel once no pending entries need it (never blocks the loop)."""
     if DATA_FEED_NAME != "iex" or ticker not in trade_subscribed_tickers or pending_entries.get(ticker):
         return
-    try:
-        if market_data_stream is not None:
-            market_data_stream.unsubscribe_trades(ticker)
-        trade_subscribed_tickers.discard(ticker)
-        first_trade_by_minute[ticker].clear()
-        print(f"IEX trade channel released: {ticker} ({len(trade_subscribed_tickers)}/{MAX_IEX_TRADE_SYMBOLS})")
-    except Exception as exc:
-        print(f"Could not release IEX trade channel for {ticker}: {exc}")
+    trade_subscribed_tickers.discard(ticker)
+    first_trade_by_minute[ticker].clear()
+    _stream_control_executor.submit(_unsubscribe_trades_worker, ticker)
 
 def refresh_telegram_five_minute_history(ticker):
     """Maintain completed 5-minute candles for existing Telegram commands only."""
@@ -1230,6 +1351,9 @@ def seed_history(raw_df):
         if not rows.empty:
             last_processed_1m[ticker] = pd.Timestamp(rows.iloc[-1]["time"])
             refresh_telegram_five_minute_history(ticker)
+            seeded = build_strategy_df(ticker)
+            if not seeded.empty:
+                record_latest_indicators(ticker, seeded.iloc[-1])
 
 
 def build_strategy_df(ticker):
@@ -1355,17 +1479,22 @@ def select_call_contract(
 # WAIT FOR ORDER FILL
 # ============================================================
 
+def _status_name(order):
+    """'OrderStatus.PARTIALLY_FILLED' or 'partially_filled' -> 'partially_filled'."""
+    return str(getattr(order, "status", "") or "").lower().split(".")[-1]
+
+
 def wait_for_order_fill(
     order_id,
     timeout_seconds=30,
 ):
+    """Poll until the order is filled/canceled/rejected/expired; None if it is still open.
 
-    start = datetime.now()
+    A partially filled order is NOT treated as complete."""
 
-    while (
-        datetime.now()
-        - start
-    ).total_seconds() < timeout_seconds:
+    start = time.monotonic()
+
+    while time.monotonic() - start < timeout_seconds:
 
         try:
             order = (
@@ -1375,17 +1504,12 @@ def wait_for_order_fill(
                 )
             )
 
-            status = str(
-                order.status
-            ).lower()
-
-            if "filled" in status:
-                return order
-
-            if (
-                "canceled" in status
-                or "rejected" in status
-                or "expired" in status
+            if _status_name(order) in (
+                "filled",
+                "canceled",
+                "cancelled",
+                "rejected",
+                "expired",
             ):
                 return order
 
@@ -1396,11 +1520,71 @@ def wait_for_order_fill(
                 exc,
             )
 
-        import time
         time.sleep(1)
 
     return None
 
+
+def cancel_and_read_order(order_id, label):
+    """After a confirmation timeout: cancel the order so it cannot fill later as an untracked
+    position (entry) or be sold twice (exit), then read its final state."""
+    try:
+        trading_client.cancel_order_by_id(order_id)
+    except Exception as exc:
+        print(f"{label}: cancel request failed (the order may already be filled or closed): {exc}")
+    time.sleep(1.5)
+    try:
+        return trading_client.get_order_by_id(order_id)
+    except Exception as exc:
+        print(f"{label}: could not read the final order state: {exc}")
+        return None
+
+
+def _record_partial_exit(entry, order, sold_qty, current_time, underlying_price, reason):
+    """Part of an exit order filled: book the sold slice as its own closed trade and keep the
+    remaining contracts open so the next candle can sell them."""
+    exit_price = None
+    if getattr(order, "filled_avg_price", None):
+        exit_price = float(order.filled_avg_price)
+    entry_price = entry.get("entry_option")
+
+    closed = dict(entry)
+    closed["contracts"] = sold_qty
+    closed["db_id"] = None
+    closed["entry_order_id"] = f"{entry.get('entry_order_id')}:PARTIAL:{order.id}"
+    closed["exit_time"] = current_time
+    closed["exit_underlying"] = float(underlying_price)
+    closed["exit_option"] = exit_price
+    closed["exit_order_id"] = str(order.id)
+    closed["exit_reason"] = reason
+    closed["pnl"] = (
+        (exit_price - float(entry_price)) * sold_qty * 100
+        if exit_price is not None and entry_price is not None
+        else None
+    )
+    save_trade_entry(closed)
+    save_trade_exit(closed)
+    all_trades.append(closed)
+
+    entry["contracts"] = int(entry["contracts"]) - sold_qty
+    if entry.get("db_id"):
+        try:
+            conn = sqlite3.connect(TRADE_DB_PATH)
+            conn.execute("UPDATE trades SET contracts = ? WHERE id = ?", (entry["contracts"], entry["db_id"]))
+            conn.commit()
+            conn.close()
+        except Exception as exc:
+            print(f"Could not persist reduced contract count for {entry.get('ticker')}: {exc}")
+
+    notify(
+        f"⚠️ PARTIAL EXIT\n"
+        f"{entry.get('ticker')} — LONG CALL\n"
+        f"Contract: {entry.get('option_symbol')}\n"
+        f"Sold: {sold_qty} | Still open: {entry['contracts']}\n"
+        f"Reason: {reason}\n"
+        f"The remaining contracts will be sold on the next candle."
+    )
+    return False
 
 # ============================================================
 # OPTION ENTRY
@@ -1550,46 +1734,32 @@ def execute_option_entry(
 
         return None
 
-    filled_order = wait_for_order_fill(
-        order.id
-    )
+    filled_order = wait_for_order_fill(order.id)
 
     if filled_order is None:
+        # Not confirmed in time. Cancel it so it cannot fill later as an untracked position, then
+        # look at what actually happened (it may have filled while the cancel was in flight).
+        print(f"{ticker}: entry order not confirmed within 30s; cancelling and re-checking.")
+        filled_order = cancel_and_read_order(order.id, f"{ticker} entry")
 
-        print(
-            f"{ticker}: order did not fill "
-            f"within timeout."
-        )
+    filled_qty_raw = 0.0
+    if filled_order is not None:
+        try:
+            filled_qty_raw = float(filled_order.filled_qty or 0)
+        except Exception:
+            filled_qty_raw = 0.0
 
+    if filled_order is None or filled_qty_raw <= 0:
+        status = _status_name(filled_order) if filled_order is not None else "unknown"
+        print(f"{ticker}: entry order produced no fill (status: {status}).")
         notify(
-            f"⚠️ {ticker} CALL order\n"
-            f"Order submitted but fill "
-            f"was not confirmed within "
-            f"30 seconds."
+            f"⚠️ {ticker} CALL entry NOT filled\n"
+            f"{option_symbol}\n"
+            f"Order status: {status}. No position was recorded."
         )
-
         return None
 
-    status = str(
-        filled_order.status
-    ).lower()
-
-    if "filled" not in status:
-
-        notify(
-            f"⚠️ {ticker} CALL order\n"
-            f"Order status: {status}"
-        )
-
-        return None
-
-    filled_qty = int(
-        float(
-            filled_order.filled_qty
-            or CONTRACTS
-        )
-    )
-
+    filled_qty = int(filled_qty_raw)
     filled_price = None
 
     if filled_order.filled_avg_price:
@@ -1673,6 +1843,72 @@ def execute_option_entry(
 # VALID SIGNAL
 # ============================================================
 
+def fetch_first_trade_price(ticker, minute):
+    """Price of the first trade at or after `minute` - the entry candle's open. None if no trade yet.
+
+    Asked over REST, so it does not depend on the websocket trade channel (which can only see trades
+    that happen AFTER it subscribes, i.e. seconds into the entry minute)."""
+    start = pd.Timestamp(minute).tz_convert("UTC").to_pydatetime()
+    request = StockTradesRequest(
+        symbol_or_symbols=ticker,
+        start=start,
+        end=start + timedelta(minutes=1),
+        limit=1,
+        feed=DATA_FEED,
+    )
+    response = historical_client.get_stock_trades(request)
+    data = getattr(response, "data", response)
+    trades = data.get(ticker) if hasattr(data, "get") else None
+    if not trades:
+        return None
+    return float(trades[0].price)
+
+
+async def resolve_open_via_rest(ticker, minute):
+    """Wait for the first trade of the entry minute, then run the normal next-open entry check."""
+    failures = 0
+    try:
+        deadline = time.monotonic() + ENTRY_OPEN_REST_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if not any(
+                pd.Timestamp(p["signal_time"]) + pd.Timedelta(minutes=1) == minute
+                for p in pending_entries[ticker]
+            ):
+                return  # already handled by the websocket path, or expired
+            try:
+                price = await asyncio.to_thread(fetch_first_trade_price, ticker, minute)
+            except Exception as exc:
+                failures += 1
+                if failures == 1:
+                    print(f"{ticker}: REST open lookup failed: {exc}")
+                price = None
+            if price is not None:
+                print(f"{ticker}: REST first trade of {minute:%H:%M} = {price:.4f}")
+                execute_pending_open(ticker, minute, price)
+                return
+            await asyncio.sleep(1.5)
+        print(f"{ticker}: no REST trade found for entry minute {minute:%H:%M} within {ENTRY_OPEN_REST_TIMEOUT_SECONDS}s")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"{ticker}: REST open lookup error: {exc}")
+    finally:
+        rest_open_lookups.discard((ticker, minute))
+
+
+def schedule_rest_open_lookup(ticker, minute):
+    minute = pd.Timestamp(minute)
+    key = (ticker, minute)
+    if key in rest_open_lookups:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    rest_open_lookups.add(key)
+    _spawn(resolve_open_via_rest(ticker, minute))
+
+
 def queue_valid_signal(ticker, previous, signal):
     # Removed tickers can be streamed to manage existing positions, but never open new V3 trades.
     if ticker not in TICKERS:
@@ -1723,6 +1959,9 @@ def queue_valid_signal(ticker, previous, signal):
     cached_open = first_trade_by_minute[ticker].get(next_minute)
     if cached_open is not None:
         execute_pending_open(ticker, next_minute, cached_open)
+    elif pending_entries[ticker]:
+        # Ask REST for the true first trade of the entry minute (the candle open).
+        schedule_rest_open_lookup(ticker, next_minute)
 
 
 # ============================================================
@@ -1819,35 +2058,33 @@ def execute_option_exit(
 
         return False
 
-    filled_order = wait_for_order_fill(
-        order.id
-    )
+    filled_order = wait_for_order_fill(order.id)
 
     if filled_order is None:
+        # Cancel before anything else so the next candle cannot send a second sell for the same contracts.
+        print(f"{entry['ticker']}: exit order not confirmed within 30s; cancelling and re-checking.")
+        filled_order = cancel_and_read_order(order.id, f"{entry['ticker']} exit")
 
+    sold_raw = 0.0
+    if filled_order is not None:
+        try:
+            sold_raw = float(filled_order.filled_qty or 0)
+        except Exception:
+            sold_raw = 0.0
+
+    if filled_order is None or sold_raw <= 0:
+        status = _status_name(filled_order) if filled_order is not None else "unknown"
         notify(
-            f"⚠️ {entry['ticker']} EXIT\n"
+            f"⚠️ {entry['ticker']} EXIT not filled\n"
             f"{symbol}\n"
-            f"Exit order submitted but "
-            f"fill not confirmed."
+            f"Order status: {status}\n"
+            f"The position stays open; the bot retries on the next candle."
         )
-
         return False
 
-    status = str(
-        filled_order.status
-    ).lower()
-
-    if "filled" not in status:
-
-        notify(
-            f"⚠️ {entry['ticker']} EXIT\n"
-            f"{symbol}\n"
-            f"Order status: {status}"
-        )
-
-        return False
-
+    sold_qty = int(sold_raw)
+    if sold_qty < qty:
+        return _record_partial_exit(entry, filled_order, sold_qty, current_time, underlying_price, reason)
     exit_price = None
 
     if filled_order.filled_avg_price:
@@ -1936,6 +2173,8 @@ def check_v3_exits(ticker, candle, strategy_df):
     eod = current_time.time() >= FINAL_CANDLE_TIME
     remaining = []
     for entry in list(active_entries[ticker]):
+        if entry.get("exit_time") is not None:
+            continue  # already closed (for example by reconciliation); drop it
         entry_time = pd.Timestamp(entry["entry_time"])
         if entry_time.date() != current_time.date() or current_time < entry_time:
             remaining.append(entry); continue
@@ -1982,9 +2221,50 @@ def check_v3_exits(ticker, candle, strategy_df):
     active_entries[ticker] = remaining
 
 
+def _num(value):
+    """float(value), or None for NaN / missing."""
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return None if number != number else number
+
+
+def record_latest_indicators(ticker, row):
+    """Remember the latest completed-candle indicators for Telegram /now."""
+    try:
+        latest_indicators[ticker] = {
+            "time": pd.Timestamp(row["time"]),
+            "close": _num(row.get("close")),
+            "session_vwap": _num(row.get("session_vwap")),
+            "ema9": _num(row.get("ema9")),
+            "atr14": _num(row.get("atr14")),
+        }
+    except Exception as exc:
+        print(f"Could not record indicators for {ticker}: {exc}")
+
+
+def expire_stale_pending(ticker, candle_time):
+    """Drop pending entries whose entry minute is over (that minute's own candle has completed)."""
+    expired = [
+        p for p in pending_entries[ticker]
+        if pd.Timestamp(p["signal_time"]) + pd.Timedelta(minutes=1) <= candle_time
+    ]
+    if not expired:
+        return
+    for pending in expired:
+        remove_pending_signal(ticker, pending["signal_time"], pending.get("threshold"))
+        print(f"{ticker}: pending signal {pd.Timestamp(pending['signal_time']):%H:%M} expired - no entry-minute open was available")
+    pending_entries[ticker] = [p for p in pending_entries[ticker] if p not in expired]
+    release_trade_subscription_if_idle(ticker)
+
+
 def process_completed_1m_candle(ticker, candle):
     timestamp = pd.Timestamp(candle["time"])
-    if last_processed_1m[ticker] == timestamp:
+    last = last_processed_1m[ticker]
+    # Ignore duplicates and anything not newer than what was already processed: a late REST or
+    # stream bar must never be evaluated out of order.
+    if last is not None and timestamp <= pd.Timestamp(last):
         return
     last_processed_1m[ticker] = timestamp
     one_minute_history[ticker].append(candle)
@@ -1992,12 +2272,15 @@ def process_completed_1m_candle(ticker, candle):
     strategy_df = build_strategy_df(ticker)
     if strategy_df.empty:
         return
+    record_latest_indicators(ticker, strategy_df.iloc[-1])
     check_v3_exits(ticker, candle, strategy_df)
+    expire_stale_pending(ticker, timestamp)
     if timestamp.time() >= FINAL_CANDLE_TIME:
         last_eod_date[ticker] = timestamp.date()
         for pending in list(pending_entries[ticker]):
             remove_pending_signal(ticker, pending["signal_time"])
         pending_entries[ticker] = []
+        release_trade_subscription_if_idle(ticker)
         return
     if len(strategy_df) < 2:
         return
@@ -2008,6 +2291,22 @@ def process_completed_1m_candle(ticker, candle):
 # 1-MINUTE BAR HANDLER
 # ============================================================
 
+def guarded(handler):
+    """Keep one failing callback from aborting the rest of a websocket message batch.
+
+    alpaca-py dispatches every message of a frame in sequence; an exception escaping a handler
+    would skip the remaining tickers' bars for that minute."""
+    @functools.wraps(handler)
+    async def wrapper(arg):
+        try:
+            await handler(arg)
+        except Exception as exc:
+            print(f"HANDLER ERROR in {handler.__name__}: {exc!r}")
+            traceback.print_exc()
+    return wrapper
+
+
+@guarded
 async def handle_bar(bar):
     ticker = bar.symbol
     if ticker not in one_minute_history:
@@ -2015,6 +2314,7 @@ async def handle_bar(bar):
     timestamp = ny_time(bar.timestamp)
     if not is_regular_session_time(timestamp):
         return
+    runtime_stats["bars_stream"] += 1
     record = {"ticker": ticker, "time": timestamp, "open": float(bar.open), "high": float(bar.high),
               "low": float(bar.low), "close": float(bar.close), "volume": float(bar.volume),
               "vwap": float(getattr(bar, "vwap", 0) or 0)}
@@ -2025,9 +2325,11 @@ async def handle_bar(bar):
         existing[-1] = record
         return
     process_completed_1m_candle(ticker, record)
-    refresh_telegram_five_minute_history(ticker)
+    # Telegram's legacy 5-minute view only changes when a 5-minute bucket completes.
+    if timestamp.minute % 5 == 4:
+        refresh_telegram_five_minute_history(ticker)
 
-
+@guarded
 async def handle_trade(trade):
     ticker = getattr(trade, "symbol", None)
     if ticker not in pending_entries:
@@ -2045,6 +2347,278 @@ async def handle_trade(trade):
     for old_minute in sorted(bucket_map)[:-10]:
         bucket_map.pop(old_minute, None)
     execute_pending_open(ticker, minute, bucket_map[minute])
+
+
+# ============================================================
+# BACKGROUND SAFETY TASKS
+# ============================================================
+
+def _spawn(coro):
+    """Run a coroutine as a background task and keep a strong reference to it."""
+    task = asyncio.get_running_loop().create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
+
+def market_is_open_now(now=None):
+    now = now or datetime.now(TIMEZONE)
+    return now.weekday() < 5 and _clock("09:30") <= now.time() < _clock("16:00")
+
+
+def last_bar_time():
+    stamps = [pd.Timestamp(last_processed_1m[t]) for t in TICKERS if last_processed_1m[t] is not None]
+    return max(stamps) if stamps else None
+
+
+def strategy_description():
+    """Static strategy facts for Telegram, built from the live constants so the text cannot drift."""
+    windows = {}
+    for ticker in TICKERS:
+        cfg = ticker_config(ticker)
+        windows[ticker] = {"start": cfg["start"], "end": cfg["end"],
+                           "thresholds": list(cfg["thresholds"]), "source": cfg["source"]}
+    return {
+        "name": "V3 Giveback",
+        "timeframe": "1 minute",
+        "contracts": CONTRACTS,
+        "universe_count": len(TICKERS),
+        "removed": list(REMOVED_TICKERS),
+        "default_start": DEFAULT_ENTRY_START,
+        "default_end": DEFAULT_ENTRY_END,
+        "default_thresholds": list(DEFAULT_THRESHOLDS),
+        "windows": windows,
+        "ema_length": EMA_LENGTH,
+        "atr_length": ATR_LENGTH,
+        "giveback_activation_atr": GIVEBACK_ACTIVATION_ATR,
+        "giveback_fraction": GIVEBACK_FRACTION,
+        "eod_candle": FINAL_CANDLE_TIME.strftime("%H:%M"),
+        "eod_flatten_seconds": EOD_FLATTEN_SECONDS_BEFORE_CLOSE,
+        "parallel_thresholds": PARALLEL_THRESHOLD_TRADES,
+        "feed": DATA_FEED_NAME.upper(),
+        "orders_enabled": ORDERS_ENABLED,
+        "paper": PAPER_MODE,
+    }
+
+
+def runtime_snapshot():
+    """Read-only runtime facts for Telegram /status (safe to call from any thread)."""
+    now = datetime.now(TIMEZONE)
+    last = last_bar_time()
+    return {
+        "now": now,
+        "market_open": market_is_open_now(now),
+        "uptime_seconds": time.time() - runtime_stats["started"],
+        "loop_age_seconds": time.time() - runtime_stats["loop_tick"],
+        "bars_stream": runtime_stats["bars_stream"],
+        "bars_rest": runtime_stats["bars_rest"],
+        "last_bar_time": last,
+        "last_bar_age_seconds": (pd.Timestamp(now) - last).total_seconds() if last is not None else None,
+        "tickers_with_data": sum(1 for t in TICKERS if latest_indicators.get(t)),
+        "trade_subscriptions": len(trade_subscribed_tickers),
+        "max_trade_subscriptions": MAX_IEX_TRADE_SYMBOLS,
+        "pending_signals": sum(len(v) for v in pending_entries.values()),
+        "open_positions": sum(len(v) for v in active_entries.values()),
+    }
+
+
+def build_telegram_state():
+    """The shared state handed to telegram_bot (the same objects the strategy mutates)."""
+    return {
+        "active_entries": active_entries,
+        "all_trades": all_trades,
+        "five_minute_history": five_minute_history,  # legacy 5-minute view, kept for compatibility
+        "one_minute_history": one_minute_history,
+        "latest_indicators": latest_indicators,
+        "pending_entries": pending_entries,
+        "tickers": list(TICKERS),
+        "strategy": strategy_description(),
+        "runtime": runtime_snapshot,
+    }
+
+
+async def heartbeat_loop():
+    """Once a minute: prove the loop is alive, report data flow, alert if bars stop arriving."""
+    prev_stream = runtime_stats["bars_stream"]
+    prev_rest = runtime_stats["bars_rest"]
+    quiet_minutes = 0
+    alerted = False
+    while True:
+        await asyncio.sleep(60)
+        runtime_stats["loop_tick"] = time.time()
+        now = datetime.now(TIMEZONE)
+        d_stream = runtime_stats["bars_stream"] - prev_stream
+        d_rest = runtime_stats["bars_rest"] - prev_rest
+        prev_stream = runtime_stats["bars_stream"]
+        prev_rest = runtime_stats["bars_rest"]
+        last = last_bar_time()
+        last_text = f"{last:%H:%M}" if last is not None else "none"
+        print(
+            f"HEARTBEAT {now:%H:%M:%S} ET | bars last min: stream={d_stream} rest={d_rest} "
+            f"| last bar {last_text} ET | pending {sum(len(v) for v in pending_entries.values())} "
+            f"| open {sum(len(v) for v in active_entries.values())} "
+            f"| trade subs {len(trade_subscribed_tickers)}"
+        )
+        in_session = market_is_open_now(now) and now.time() >= _clock("09:36")
+        if in_session and d_stream == 0:
+            quiet_minutes += 1
+        else:
+            quiet_minutes = 0
+            if d_stream > 0:
+                alerted = False
+        if quiet_minutes >= 3 and not alerted:
+            alerted = True
+            if d_rest > 0:
+                note = "The REST gap-filler is covering the missing bars."
+            else:
+                note = "NO market data is arriving at all."
+            print(f"WARNING: no websocket 1m bars for {quiet_minutes} minutes during market hours. {note}")
+            notify(
+                f"⚠️ No websocket 1-minute bars for {quiet_minutes} minutes during market hours.\n"
+                f"{note}\n"
+                f"Look for 'symbol limit exceeded' in the Railway logs."
+            )
+
+
+def watchdog_thread():
+    """Runs OUTSIDE the event loop, so it still works when the loop is frozen."""
+    while True:
+        time.sleep(30)
+        stalled_for = time.time() - runtime_stats["loop_tick"]
+        if stalled_for > WATCHDOG_STALL_SECONDS:
+            print(f"WATCHDOG: event loop made no progress for {stalled_for:.0f}s; exiting so Railway restarts the bot.")
+            notify(f"🔴 WATCHDOG: the bot's event loop was frozen for {stalled_for:.0f}s. Restarting.")
+            time.sleep(4)  # let the notification thread send before the process disappears
+            os._exit(1)
+
+
+def fetch_recent_bars(symbol_starts, end):
+    """REST 1-minute bars for {ticker: start}. Records have the same shape as the stream handler's."""
+    records = []
+    tickers = sorted(symbol_starts)
+    batch_size = 15  # Alpaca's bar limit applies to the whole multi-symbol response
+    for offset in range(0, len(tickers), batch_size):
+        batch = tickers[offset:offset + batch_size]
+        request = StockBarsRequest(
+            symbol_or_symbols=batch,
+            timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+            start=min(symbol_starts[t] for t in batch),
+            end=end,
+            feed=DATA_FEED,
+            limit=10000,
+        )
+        part = historical_client.get_stock_bars(request).df.reset_index()
+        if part.empty:
+            continue
+        if "symbol" in part.columns:
+            part = part.rename(columns={"symbol": "ticker"})
+        part["timestamp"] = pd.to_datetime(part["timestamp"], utc=True).dt.tz_convert(TIMEZONE)
+        if "vwap" not in part.columns:
+            part["vwap"] = (part["high"] + part["low"] + part["close"]) / 3.0
+        for row in part.sort_values(["ticker", "timestamp"]).to_dict("records"):
+            records.append({
+                "ticker": row["ticker"], "time": row["timestamp"],
+                "open": float(row["open"]), "high": float(row["high"]),
+                "low": float(row["low"]), "close": float(row["close"]),
+                "volume": float(row["volume"]), "vwap": float(row.get("vwap") or 0),
+            })
+    return records
+
+
+async def rest_bar_gapfill_loop():
+    """Safety net for missing websocket bars. Once a minute, ask REST for the completed bars of any
+    ticker that is behind and feed them through the normal candle pipeline. When the websocket is
+    healthy nothing is behind except genuinely illiquid tickers (cheap, one request)."""
+    errors = 0
+    while True:
+        now = datetime.now(TIMEZONE)
+        await asyncio.sleep(60 - now.second - now.microsecond / 1e6 + GAPFILL_DELAY_SECONDS)
+        try:
+            now = datetime.now(TIMEZONE)
+            if not (now.weekday() < 5 and _clock("09:31") <= now.time() <= _clock("16:01")):
+                continue
+            expected = pd.Timestamp(now.replace(second=0, microsecond=0)) - pd.Timedelta(minutes=1)
+            session_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            behind = {}
+            for ticker in sorted(set(TICKERS) | {t for t, e in active_entries.items() if e}):
+                last = last_processed_1m.get(ticker)
+                if last is not None and pd.Timestamp(last) >= expected:
+                    continue
+                start = session_open
+                if last is not None and pd.Timestamp(last).date() == now.date():
+                    start = max(session_open, (pd.Timestamp(last) - pd.Timedelta(minutes=1)).to_pydatetime())
+                behind[ticker] = start
+            if not behind:
+                continue
+            records = await asyncio.to_thread(fetch_recent_bars, behind, now)
+            fed = 0
+            for record in records:
+                ticker = record["ticker"]
+                timestamp = pd.Timestamp(record["time"])
+                if ticker not in last_processed_1m or not is_regular_session_time(timestamp):
+                    continue
+                last = last_processed_1m[ticker]
+                if last is not None and timestamp <= pd.Timestamp(last):
+                    continue
+                if timestamp > expected:
+                    continue  # the current minute is still open
+                process_completed_1m_candle(ticker, record)
+                runtime_stats["bars_rest"] += 1
+                fed += 1
+            if fed:
+                print(f"REST gap-fill: fed {fed} missing 1m bars ({len(behind)} tickers were behind)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            errors += 1
+            if errors <= 3 or errors % 30 == 0:
+                print(f"REST gap-fill error: {exc}")
+
+
+def flatten_open_entries_for_eod():
+    """Sell every open bot position just before the close (the strategy's END_OF_DAY exit)."""
+    now = pd.Timestamp(datetime.now(TIMEZONE))
+    flattened = 0
+    for ticker in list(MANAGED_TICKERS):
+        entries = list(active_entries.get(ticker) or [])
+        if not entries:
+            continue
+        rows = one_minute_history.get(ticker) or []
+        price = float(rows[-1]["close"]) if rows else float(entries[0].get("entry_underlying") or 0.0)
+        remaining = []
+        for entry in entries:
+            if entry.get("exit_time") is not None:
+                continue
+            if execute_option_exit(entry, now, price, "END_OF_DAY"):
+                flattened += 1
+            else:
+                remaining.append(entry)
+        active_entries[ticker] = remaining
+    still_open = sum(len(v) for v in active_entries.values())
+    print(f"EOD flatten: closed {flattened} position(s); {still_open} still open")
+    if still_open:
+        notify(f"⚠️ EOD flatten finished with {still_open} position(s) still open. Check Alpaca now.")
+    return flattened
+
+
+async def eod_flatten_loop():
+    if EOD_FLATTEN_SECONDS_BEFORE_CLOSE <= 0:
+        print("EOD pre-close flatten: DISABLED")
+        return
+    done_for = None
+    while True:
+        await asyncio.sleep(1)
+        now = datetime.now(TIMEZONE)
+        if now.weekday() >= 5 or done_for == now.date():
+            continue
+        target = now.replace(hour=16, minute=0, second=0, microsecond=0) - timedelta(seconds=EOD_FLATTEN_SECONDS_BEFORE_CLOSE)
+        if target <= now < target + timedelta(seconds=90):
+            done_for = now.date()
+            try:
+                flatten_open_entries_for_eod()
+            except Exception as exc:
+                print(f"EOD flatten error: {exc}")
+                notify(f"🔴 EOD flatten failed: {exc}\nCheck open positions at Alpaca now.")
 
 
 # ============================================================
@@ -2126,7 +2700,7 @@ async def main():
         notify(f"⚠️ Startup position reconciliation failed\n{exc}")
 
     # Keep the internal state synchronized with Alpaca while the bot runs.
-    asyncio.create_task(reconciliation_loop())
+    _spawn(reconciliation_loop())
     print("Alpaca position reconciliation loop started (30s).")
 
     # --------------------------------------------------------
@@ -2175,27 +2749,10 @@ async def main():
 
         try:
 
-            telegram_state = {
-                "active_entries":
-                    active_entries,
-
-                "all_trades":
-                    all_trades,
-
-                "five_minute_history":
-                    five_minute_history,
-
-            }
-
-            asyncio.create_task(
+            _spawn(
                 telegram_poll_loop(
-                    telegram_state
+                    build_telegram_state()
                 )
-            )
-
-            print(
-                "Telegram command listener "
-                "started."
             )
 
         except Exception as exc:
@@ -2204,7 +2761,6 @@ async def main():
                 "Telegram listener failed:"
             )
             print(exc)
-
     # --------------------------------------------------------
     # LIVE STREAM
     # --------------------------------------------------------
@@ -2217,11 +2773,16 @@ async def main():
     )
     market_data_stream = stream
 
-    # IEX permits minute bars for all symbols, but Basic-plan trade channels are capped
-    # at 30. Subscribe bars for the complete V3 universe and trade events only for
-    # symbols with pending next-minute entries.
-    for ticker in MANAGED_TICKERS:
+    # Subscribe minute bars for the V3 universe, plus any excluded ticker that still has an open
+    # position to manage. Trade events are subscribed only for symbols with pending entries.
+    stream_tickers = sorted(set(TICKERS) | {t for t, entries in active_entries.items() if entries})
+    for ticker in stream_tickers:
         stream.subscribe_bars(handle_bar, ticker)
+    print(
+        f"Websocket bar subscriptions requested: {len(stream_tickers)} symbols. Alpaca Basic documents a "
+        f"30-symbol websocket cap: look for 'subscribed to bars' (accepted) or 'symbol limit exceeded' "
+        f"(rejected; the REST gap-filler then supplies the bars)."
+    )
 
     pending_tickers = [ticker for ticker in MANAGED_TICKERS if pending_entries[ticker]]
     for ticker in pending_tickers[:MAX_IEX_TRADE_SYMBOLS]:
@@ -2275,6 +2836,10 @@ async def main():
         "Overnight: DISABLED"
     )
     print(
+        f"EOD pre-close flatten: {EOD_FLATTEN_SECONDS_BEFORE_CLOSE}s before 16:00 ET "
+        f"(0 = off); watchdog {WATCHDOG_STALL_SECONDS}s; REST gap-fill + REST entry-open lookup ON"
+    )
+    print(
         "Orders: "
         + (
             "ENABLED"
@@ -2294,7 +2859,17 @@ async def main():
         "========================================"
     )
 
+    runtime_stats["loop_tick"] = time.time()
+    _spawn(heartbeat_loop())
+    _spawn(rest_bar_gapfill_loop())
+    _spawn(eod_flatten_loop())
+    threading.Thread(target=watchdog_thread, daemon=True, name="watchdog").start()
+
     await stream._run_forever()
+
+    # _run_forever() only returns when the stream gives up (for example "insufficient subscription").
+    # Returning normally would end the process with exit code 0 and Railway would NOT restart it.
+    raise RuntimeError("Market-data stream stopped; exiting so the platform restarts the bot")
 
 
 # ============================================================
